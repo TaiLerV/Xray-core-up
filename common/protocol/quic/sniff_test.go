@@ -29,6 +29,78 @@ func readDatagrams(tb testing.TB, prefix string, n int) [][]byte {
 	return datagrams
 }
 
+// The dispatcher sniffs the datagrams of a flow concatenated, adding one at a
+// time, so a client's first flight is found after the datagram that completes
+// its ClientHello, and must only ask for more data before that. The cases are
+// those Hysteria 2.13.0 sniffs (extras/sniff TestSnifferUDP), plus padding that
+// is not zero bytes.
+func TestSniffQUICAcrossDatagrams(t *testing.T) {
+	chrome := readDatagrams(t, "quic-chrome153", 3)
+	firefox := readDatagrams(t, "quic-firefox153esr", 2)
+	curl := readDatagrams(t, "quic-curl8.14-openssl3.5", 2)
+
+	// Firefox pads each datagram with zero bytes after its Initial packet.
+	const firefoxPacketLen = 993
+	randomPadding := bytes.Clone(firefox[0])
+	for i := firefoxPacketLen; i < len(randomPadding); i++ {
+		randomPadding[i] = byte(i*131 + 7)
+	}
+
+	tests := []struct {
+		name      string
+		datagrams [][]byte
+		domain    string
+	}{
+		// Chrome shuffles the ClientHello fragments across two datagrams, and
+		// retransmits them split differently.
+		{"Chrome 153", chrome[:2], "chrome.sniff.test"},
+		{"Chrome 153 reordered", [][]byte{chrome[1], chrome[0]}, "chrome.sniff.test"},
+		{"Chrome 153 retransmitted", [][]byte{chrome[1], chrome[2]}, "chrome.sniff.test"},
+		{"Firefox 153 ESR", firefox, "firefox.sniff.test"},
+		{"Firefox 153 ESR reordered", [][]byte{firefox[1], firefox[0]}, "firefox.sniff.test"},
+		{"Firefox 153 ESR with random padding", [][]byte{randomPadding, firefox[1]}, "firefox.sniff.test"},
+		{"curl 8.14 with OpenSSL 3.5", curl, "curl.sniff.test"},
+		// quiche retransmits the first datagram before sending the second.
+		{"quiche", readDatagrams(t, "quic-quiche", 3), "quiche.sniff.test"},
+		{"ngtcp2 1.11", readDatagrams(t, "quic-ngtcp2-1.11", 1), "ngtcp2.sniff.test"},
+		{"aioquic 1.2", readDatagrams(t, "quic-aioquic1.2", 1), "aioquic.sniff.test"},
+		{"other connections ignored", [][]byte{chrome[0], firefox[1], curl[1], chrome[1]}, "chrome.sniff.test"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var flow []byte
+			for i, datagram := range tt.datagrams {
+				flow = append(flow, datagram...)
+				header, err := quic.SniffQUIC(bytes.Clone(flow))
+				if i < len(tt.datagrams)-1 {
+					if !errors.Is(err, protocol.ErrProtoNeedMoreData) {
+						t.Fatalf("after datagram %d: SniffQUIC() error = %v, want more data", i, err)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatalf("after datagram %d: SniffQUIC() error = %v, want %q", i, err, tt.domain)
+				}
+				if header.Domain() != tt.domain {
+					t.Fatalf("SniffQUIC() domain = %q, want %q", header.Domain(), tt.domain)
+				}
+			}
+		})
+	}
+
+	t.Run("not QUIC", func(t *testing.T) {
+		if _, err := quic.SniffQUIC([]byte("oh my sweet summer child")); err == nil || errors.Is(err, protocol.ErrProtoNeedMoreData) {
+			t.Fatalf("SniffQUIC() error = %v, want a rejection", err)
+		}
+	})
+	t.Run("Initial protected for another version", func(t *testing.T) {
+		draft29 := append([]byte{chrome[0][0], 0xff, 0x00, 0x00, 0x1d}, chrome[0][5:]...)
+		if _, err := quic.SniffQUIC(draft29); err == nil || errors.Is(err, protocol.ErrProtoNeedMoreData) {
+			t.Fatalf("SniffQUIC() error = %v, want a rejection", err)
+		}
+	})
+}
+
 // The dispatcher can hand the sniffer the cached datagram itself and forward
 // that datagram afterwards, so sniffing must not write to its input.
 func TestSniffQUICLeavesInputUnchanged(t *testing.T) {
@@ -407,13 +479,78 @@ func TestSniffQUICRetryPacket(t *testing.T) {
 	}
 }
 
+// forgedFlow returns a real client Initial datagram followed by as many forged
+// Initial packets of its connection as the dispatcher caches (32 KiB), none of
+// which authenticates, and the number of forged packets.
+func forgedFlow(tb testing.TB) ([]byte, int) {
+	tb.Helper()
+	first := readDatagrams(tb, "quic-chrome153", 1)[0]
+	destConnID := first[6 : 6+int(first[5])]
+	forged := append([]byte{0xc0, 0, 0, 0, 1, byte(len(destConnID))}, destConnID...)
+	forged = append(forged, 0, 0, 0x40, 24) // no Source Connection ID or token, 24-byte packet
+	forged = append(forged, make([]byte, 24)...)
+	flow := bytes.Clone(first)
+	n := 0
+	for len(flow)+len(forged) <= 32767 {
+		flow = append(flow, forged...)
+		n++
+	}
+	return flow, n
+}
+
+// A client can fill the flow with Initial packets of its connection that do
+// not authenticate. Each must be skipped without deriving the connection's
+// keys again, which costs about 48 allocations a packet.
+func TestSniffQUICSkipsForgedPacketsCheaply(t *testing.T) {
+	flow, forged := forgedFlow(t)
+	payload := make([]byte, len(flow))
+	allocations := testing.AllocsPerRun(20, func() {
+		copy(payload, flow)
+		if _, err := quic.SniffQUIC(payload); !errors.Is(err, protocol.ErrProtoNeedMoreData) {
+			t.Fatalf("SniffQUIC() error = %v, want more data", err)
+		}
+	})
+	if limit := float64(2 * forged); allocations > limit {
+		t.Fatalf("SniffQUIC() made %.0f allocations for %d forged packets, want at most %.0f", allocations, forged, limit)
+	}
+}
+
+// Clients send the datagrams the sniffer reads, so whatever they hold must
+// neither panic it nor make it write to its input.
+func FuzzSniffQUIC(f *testing.F) {
+	chrome := readDatagrams(f, "quic-chrome153", 3)
+	firefox := readDatagrams(f, "quic-firefox153esr", 2)
+	quiche := readDatagrams(f, "quic-quiche", 3)
+	for _, seed := range [][]byte{
+		chrome[0],
+		bytes.Join(chrome[:2], nil),
+		firefox[0],
+		bytes.Join(firefox, nil),
+		bytes.Join(quiche, nil),
+		bytes.Join([][]byte{chrome[0], firefox[1], chrome[1]}, nil),
+		readDatagrams(f, "quic-aioquic1.2", 1)[0],
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, payload []byte) {
+		original := bytes.Clone(payload)
+		_, _ = quic.SniffQUIC(payload)
+		if !bytes.Equal(payload, original) {
+			t.Fatal("SniffQUIC modified its input")
+		}
+	})
+}
+
 func BenchmarkSniffQUIC(b *testing.B) {
+	forged, _ := forgedFlow(b)
 	for _, bench := range []struct {
 		name    string
 		payload []byte
+		want    error
 	}{
-		{"one datagram", readDatagrams(b, "quic-ngtcp2-1.11", 1)[0]},
-		{"two datagrams", bytes.Join(readDatagrams(b, "quic-chrome153", 2), nil)},
+		{"one datagram", readDatagrams(b, "quic-ngtcp2-1.11", 1)[0], nil},
+		{"two datagrams", bytes.Join(readDatagrams(b, "quic-chrome153", 2), nil), nil},
+		{"forged packets", forged, protocol.ErrProtoNeedMoreData},
 	} {
 		b.Run(bench.name, func(b *testing.B) {
 			payload := make([]byte, len(bench.payload))
@@ -421,7 +558,7 @@ func BenchmarkSniffQUIC(b *testing.B) {
 			b.SetBytes(int64(len(payload)))
 			for b.Loop() {
 				copy(payload, bench.payload)
-				if _, err := quic.SniffQUIC(payload); err != nil {
+				if _, err := quic.SniffQUIC(payload); !errors.Is(err, bench.want) {
 					b.Fatal(err)
 				}
 			}
