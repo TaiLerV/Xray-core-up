@@ -7,6 +7,7 @@ import (
 	stdnet "net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -150,17 +151,34 @@ func TestHysteriaRoutesQUICBySniffedServerName(t *testing.T) {
 				}
 			}
 
+			// Hysteria relays UDP in unreliable QUIC datagrams, which may also
+			// arrive out of order, so a lost datagram is told apart from one
+			// that was modified or routed without the sniffed server name.
+			var viaSniffed, viaDirect [][]byte
 			deadline := time.After(10 * time.Second)
-			for i, want := range datagrams {
+		receive:
+			for len(viaSniffed)+len(viaDirect) < len(datagrams) {
 				select {
 				case got := <-sniffed.received:
-					if !bytes.Equal(got, want) {
-						t.Errorf("datagram %d reached the destination modified", i)
-					}
-				case <-direct.received:
-					t.Errorf("datagram %d was routed without its sniffed server name", i)
+					viaSniffed = append(viaSniffed, got)
+				case got := <-direct.received:
+					viaDirect = append(viaDirect, got)
 				case <-deadline:
-					t.Fatalf("datagram %d did not arrive", i)
+					break receive
+				}
+			}
+			for _, got := range slices.Concat(viaSniffed, viaDirect) {
+				if !slices.ContainsFunc(datagrams, func(sent []byte) bool { return bytes.Equal(got, sent) }) {
+					t.Errorf("a %d-byte datagram reached a destination modified", len(got))
+				}
+			}
+			for i, sent := range datagrams {
+				isSent := func(got []byte) bool { return bytes.Equal(got, sent) }
+				switch {
+				case slices.ContainsFunc(viaDirect, isSent):
+					t.Errorf("datagram %d was routed without its sniffed server name", i)
+				case !slices.ContainsFunc(viaSniffed, isSent):
+					t.Errorf("datagram %d did not arrive within 10s; it may have been lost in transit", i)
 				}
 			}
 		})
