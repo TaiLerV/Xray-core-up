@@ -32,7 +32,43 @@ func (s SniffHeader) Domain() string {
 var (
 	errNotQUIC        = errors.New("not quic")
 	errNotQUICInitial = errors.New("not initial packet")
+	errNoServerName   = errors.New("no server name in the ClientHello")
 )
+
+// cryptoStreamCap bounds the CRYPTO stream offsets the sniffer keeps; a
+// ClientHello is far smaller.
+const cryptoStreamCap = 32768
+
+// cryptoReceived records which bytes of the CRYPTO stream have arrived.
+type cryptoReceived [cryptoStreamCap / 8]byte
+
+func (r *cryptoReceived) mark(from, to int32) {
+	for ; from < to && from%8 != 0; from++ {
+		r[from/8] |= 1 << (from % 8)
+	}
+	for ; to-from >= 8; from += 8 {
+		r[from/8] = 0xff
+	}
+	for ; from < to; from++ {
+		r[from/8] |= 1 << (from % 8)
+	}
+}
+
+// prefix returns where the bytes received without a gap from the start of
+// the stream end, continuing from known, the end of such a prefix.
+func (r *cryptoReceived) prefix(known, end int32) int32 {
+	for known < end {
+		if known%8 == 0 && end-known >= 8 && r[known/8] == 0xff {
+			known += 8
+			continue
+		}
+		if r[known/8]&(1<<(known%8)) == 0 {
+			break
+		}
+		known++
+	}
+	return known
+}
 
 type quicVersionSpec struct {
 	ver         uint32
@@ -77,10 +113,15 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 		return nil, common.ErrNoClue
 	}
 
-	// Crypto data separated across packets
+	// Crypto data separated across packets. Frames arrive in any order and
+	// can overlap (Chrome shuffles its ClientHello fragments, retransmissions
+	// split them differently), so data is kept at its stream offset and only
+	// the part received without gaps is read.
 	cryptoLen := int32(0)
-	cryptoDataBuf := buf.NewWithSize(32767)
+	cryptoDataBuf := buf.NewWithSize(cryptoStreamCap)
 	defer cryptoDataBuf.Release()
+	var received cryptoReceived
+	receivedLen := int32(0)
 	cache := buf.New()
 	defer cache.Release()
 	// Packets are unprotected in this copy; see initialKeys.open.
@@ -180,7 +221,7 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 				}
 				currentCryptoLen := int32(offset + length)
 				if cryptoLen < currentCryptoLen {
-					if cryptoDataBuf.Cap() < currentCryptoLen {
+					if currentCryptoLen > cryptoStreamCap {
 						return nil, io.ErrShortBuffer
 					}
 					cryptoDataBuf.Extend(currentCryptoLen - cryptoLen)
@@ -189,6 +230,7 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 				if _, err := buffer.Read(cryptoDataBuf.BytesRange(offset, currentCryptoLen)); err != nil { // Field: Crypto Data
 					return nil, io.ErrUnexpectedEOF
 				}
+				received.mark(offset, currentCryptoLen)
 			case 0x1c: // CONNECTION_CLOSE frame, only 0x1c is permitted in initial packet
 				if _, err = readShortQUICVarint(buffer); err != nil { // Field: Error Code
 					return nil, io.ErrUnexpectedEOF
@@ -210,12 +252,27 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 			}
 		}
 
-		tlsHdr := &ptls.SniffHeader{}
-		err = ptls.ReadClientHello(cryptoDataBuf.BytesRange(0, cryptoLen), tlsHdr)
-		if err != nil {
-			// The crypto data may have not been fully recovered in current packets,
-			// So we continue to sniff rest packets.
+		// The client's CRYPTO stream starts with its ClientHello: a handshake
+		// header (type 1, 24-bit length) and the body.
+		receivedLen = received.prefix(receivedLen, cryptoLen)
+		stream := cryptoDataBuf.BytesTo(receivedLen)
+		if len(stream) < 4 {
 			continue
+		}
+		if stream[0] != 1 {
+			return nil, errNoServerName
+		}
+		helloLen := 4 + (int(stream[1])<<16 | int(stream[2])<<8 | int(stream[3]))
+		if helloLen > cryptoStreamCap {
+			return nil, errNoServerName
+		}
+		if len(stream) < helloLen {
+			continue
+		}
+		tlsHdr := &ptls.SniffHeader{}
+		if err := ptls.ReadClientHello(stream[:helloLen], tlsHdr); err != nil {
+			// The whole ClientHello has arrived, so later packets cannot help.
+			return nil, errNoServerName
 		}
 		return &SniffHeader{domain: tlsHdr.Domain()}, nil
 	}
