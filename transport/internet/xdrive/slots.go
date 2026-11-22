@@ -223,16 +223,17 @@ type slotWriter struct {
 	slots chan struct{}
 	wg    sync.WaitGroup
 
-	mu       sync.Mutex
-	buf      []byte
-	seq      int64
-	size     int
-	full     int
-	lastSize int
-	held     int
-	closed   bool
-	err      error
-	first    chan []byte
+	mu          sync.Mutex
+	buf         []byte
+	seq         int64
+	size        int
+	full        int
+	lastSize    int
+	held        int
+	closed      bool
+	err         error
+	first       chan []byte
+	firstStored chan struct{}
 
 	// ackMu is held while the watermark is read, which other uploads wait for
 	ackMu    sync.Mutex
@@ -356,6 +357,7 @@ func (w *slotWriter) flushLocked() error {
 	seq := w.seq
 	w.seq++
 	if seq == 0 && w.first != nil {
+		w.firstStored = make(chan struct{})
 		select {
 		case w.first <- chunk:
 		default:
@@ -375,6 +377,9 @@ func (w *slotWriter) slotID(seq int64) string {
 
 func (w *slotWriter) upload(seq int64, chunk []byte) {
 	defer w.wg.Done()
+	if seq == 0 && w.firstStored != nil {
+		defer close(w.firstStored)
+	}
 	defer func() { <-w.slots }()
 
 	mode := byte(slotMedia)
@@ -415,6 +420,15 @@ func (w *slotWriter) drained(seq int64) (bool, error) {
 	defer w.ackMu.Unlock()
 
 	before := seq - int64(len(w.table.Slots))
+	// The reader can acknowledge segment zero from the announcement
+	// before its upload lands. A later write to that slot must wait for both.
+	if before == 0 && w.firstStored != nil {
+		select {
+		case <-w.firstStored:
+		default:
+			return false, nil
+		}
+	}
 	if w.acked >= before {
 		return true, nil
 	}
