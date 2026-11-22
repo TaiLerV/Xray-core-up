@@ -15,8 +15,10 @@ import (
 // whole one.
 type wholeDatagramConn struct {
 	net.PacketConn
-	socket *net.UDPConn
-	drops  net.DropLog
+	socket interface {
+		ReadMsgUDP([]byte, []byte) (int, int, int, *net.UDPAddr, error)
+	}
+	drops net.DropLog
 }
 
 // dropCutDatagrams returns conn reading as wholeDatagramConn does if it is a

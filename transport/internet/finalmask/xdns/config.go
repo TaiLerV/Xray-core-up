@@ -13,6 +13,9 @@ func (c *Config) WrapPacketConnClient(conn net.PacketConn, dest *net.Destination
 	return NewClient(c, dialer)
 }
 
+// PreserveServerPacketReads lets the DNS server apply its own message read limit.
+func (*Config) PreserveServerPacketReads() {}
+
 func (c *Config) WrapPacketConnServer(conn net.PacketConn, addr net.Addr, lc *finalmask.ListenConfig) (net.PacketConn, error) {
 	return NewServer(c, conn)
 }

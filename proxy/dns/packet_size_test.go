@@ -114,7 +114,8 @@ func TestDNSOutboundDropsQueriesTheSocketRefusesAsTooLong(t *testing.T) {
 
 // startRawUpstream answers each query in turn, in order: with a reply padded
 // to 9000 bytes for the query of id 2, and with upstreamAnswer for the others.
-func startRawUpstream(t *testing.T) net.Destination {
+func startRawUpstream(t *testing.T) (net.Destination, <-chan struct{}) {
+	wroteLarge := make(chan struct{}, 1)
 	t.Helper()
 	conn, err := gonet.ListenUDP("udp", &gonet.UDPAddr{IP: gonet.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -148,19 +149,25 @@ func startRawUpstream(t *testing.T) net.Destination {
 			}
 			// a reply that never left is not one that the outbound dropped
 			n, err = conn.WriteToUDP(reply, from)
+			if query.Id == 2 && err == nil && n == 9000 {
+				select {
+				case wroteLarge <- struct{}{}:
+				default:
+				}
+			}
 			if err != nil && !errors.Is(err, gonet.ErrClosed) || err == nil && n != len(reply) {
 				t.Errorf("the upstream wrote %d bytes of a reply of %d to query %d: %v", n, len(reply), query.Id, err)
 			}
 		}
 	}()
-	return net.DestinationFromAddr(conn.LocalAddr())
+	return net.DestinationFromAddr(conn.LocalAddr()), wroteLarge
 }
 
 // The DNS outbound read the upstream's replies into buffers of 8192 bytes,
 // which cut a longer one without a sign, and passed its start on as a whole
 // reply. It drops such a reply and passes on the next.
 func TestDNSOutboundDropsRepliesLongerThanARead(t *testing.T) {
-	upstream := startRawUpstream(t)
+	upstream, wroteLarge := startRawUpstream(t)
 	handler := new(dns_proxy.Handler)
 	if err := handler.Init(directAll(), &ownLinkClient{}, &timeoutOnlyPolicy{idle: time.Minute}); err != nil {
 		t.Fatal(err)
@@ -204,6 +211,11 @@ func TestDNSOutboundDropsRepliesLongerThanARead(t *testing.T) {
 			answers = append(answers, answer.Id)
 		}
 		buf.ReleaseMulti(mb)
+	}
+	select {
+	case <-wroteLarge:
+	default:
+		t.Fatal("upstream did not send the 9000-byte reply before answering query 3")
 	}
 	if !slices.Equal(answers, []uint16{1, 3}) {
 		t.Fatalf("answers %v, want 1 and 3", answers)

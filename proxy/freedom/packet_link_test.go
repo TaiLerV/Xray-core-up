@@ -3,7 +3,9 @@ package freedom
 import (
 	"bytes"
 	"context"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
@@ -82,16 +84,20 @@ func TestDialerProxyLinkKeepsDatagramsWhole(t *testing.T) {
 				conn = &stat.CounterConnection{Connection: conn, WriteCounter: counter}
 			}
 			payloads, mb := linkDatagrams()
+			original := slices.Clone(mb)
 			packetWriter := NewPacketWriter(context.Background(), conn, &Handler{}, nil, net.Destination{}, destination, nil)
 			if err := packetWriter.WriteMultiBuffer(mb); err != nil {
 				t.Fatal(err)
 			}
-			got, err := reader.ReadMultiBuffer()
+			got, err := reader.ReadMultiBufferTimeout(5 * time.Second)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer buf.ReleaseMulti(got)
 			wantLinkDatagrams(t, got, payloads)
+			if !slices.Equal(original, got) {
+				t.Fatal("link writer copied the batch instead of transferring its buffers")
+			}
 			if want := int64(9000 + buf.Size + len("ping")); counted && counter.Value() != want {
 				t.Fatalf("the statistics counted %d bytes written, want %d", counter.Value(), want)
 			}
@@ -136,7 +142,7 @@ func TestDialerProxyLinkTakesACopyOfConfiguredNoise(t *testing.T) {
 	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("ping"))}); err != nil {
 		t.Fatal(err)
 	}
-	mb, err := reader.ReadMultiBuffer()
+	mb, err := reader.ReadMultiBufferTimeout(5 * time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,5 +153,19 @@ func TestDialerProxyLinkTakesACopyOfConfiguredNoise(t *testing.T) {
 	mb[0].Bytes()[0] ^= 0xFF
 	if string(configured) != "configured noise" {
 		t.Fatalf("a change of the noise on the link changed the configured packet to %q", configured)
+	}
+}
+
+func TestDialerProxyLinkCountsOnlySuccessfulWrites(t *testing.T) {
+	conn, reader, _ := newLink(t)
+	reader.Interrupt()
+	counter := &readCounter{}
+	conn = &stat.CounterConnection{Connection: conn, WriteCounter: counter}
+	writer := NewPacketWriter(context.Background(), conn, &Handler{}, nil, net.Destination{}, net.UDPDestination(net.LocalHostIP, 53), nil)
+	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("ping"))}); err == nil {
+		t.Fatal("write to closed link succeeded")
+	}
+	if n := counter.Value(); n != 0 {
+		t.Fatalf("counted %d bytes written to a closed link", n)
 	}
 }

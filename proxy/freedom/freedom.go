@@ -552,33 +552,36 @@ type linkPacketReader struct {
 
 func (r *linkPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	mb, err := r.link.ReadMultiBuffer()
-	countLinkDatagrams(mb, r.counter)
+	clearLinkDestinations(mb)
+	if r.counter != nil {
+		r.counter.Add(int64(mb.Len()))
+	}
 	return mb, err
 }
 
-// linkPacketWriter writes each buffer to a link to another outbound as a
-// datagram of its own, where the link's Write splits one above buf.Size into
-// regular buffers that the other outbound sends as datagrams. It clears the
-// address of each, so that the other outbound sends it to the destination
-// freedom dialed, as it did, and counts what it writes in counter.
+// linkPacketWriter transfers a batch directly to the other outbound. The
+// link is bound to the dialed destination and takes ownership of its buffers.
 type linkPacketWriter struct {
 	link    buf.Writer
 	counter stats.Counter
 }
 
 func (w *linkPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	countLinkDatagrams(mb, w.counter)
-	return w.link.WriteMultiBuffer(mb)
+	clearLinkDestinations(mb)
+	var size int32
+	if w.counter != nil {
+		size = mb.Len()
+	}
+	err := w.link.WriteMultiBuffer(mb)
+	if err == nil && w.counter != nil {
+		w.counter.Add(int64(size))
+	}
+	return err
 }
 
-// countLinkDatagrams clears the address of each datagram that crosses a link
-// and adds their bytes to counter.
-func countLinkDatagrams(mb buf.MultiBuffer, counter stats.Counter) {
+func clearLinkDestinations(mb buf.MultiBuffer) {
 	for _, b := range mb {
 		b.UDP = nil
-	}
-	if counter != nil && !mb.IsEmpty() {
-		counter.Add(int64(mb.Len()))
 	}
 }
 

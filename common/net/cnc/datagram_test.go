@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/transport/pipe"
@@ -27,7 +28,7 @@ func writtenLengths(t *testing.T, datagrams bool, payloads ...[]byte) []int32 {
 			t.Fatalf("wrote %d bytes of %d: %v", n, len(payload), err)
 		}
 	}
-	mb, err := uplinkReader.ReadMultiBuffer()
+	mb, err := uplinkReader.ReadMultiBufferTimeout(5 * time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

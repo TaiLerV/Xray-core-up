@@ -1114,3 +1114,65 @@ end
 		t.Fatalf("unexpected payload: %q", got[2])
 	}
 }
+
+func TestHeaderMaskReadsIntoSmallBuffers(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  bool
+		want string
+	}{
+		{"transport", false, "lo"},
+		{"raw", true, "ok"},
+	} {
+		for _, end := range []string{"dial", "listen"} {
+			t.Run(end+"/"+test.name, func(t *testing.T) {
+				socket := newScriptedPacketConn()
+				for _, payload := range []string{"long", "ok"} {
+					packet := append([]byte{4, 0, 0, 0}, payload...)
+					socket.reads <- recordedPacketWrite{payload: packet, addr: socket.local}
+				}
+				// End the script so a reader which skips both packets fails with EOF.
+				if err := socket.Close(); err != nil {
+					t.Fatal(err)
+				}
+				stack := finalmask.NewFinalMask(nil, []finalmask.UDPMask{&header.Config{ID: int32(header.WIREGUARD)}}, nil, nil,
+					func(context.Context, net.Destination) (net.PacketConn, net.Addr, error) {
+						return socket, socket.local, nil
+					},
+					func(context.Context, net.Addr) (net.PacketConn, error) { return socket, nil })
+				var p [2]byte
+				var n int
+				if end == "dial" {
+					dial := stack.DialUDP
+					if test.raw {
+						dial = stack.DialRawUDP
+					}
+					conn, err := dial(t.Context(), net.DestinationFromAddr(socket.local))
+					if err != nil {
+						t.Fatal(err)
+					}
+					n, err = conn.Read(p[:])
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					listen := stack.ListenPacket
+					if test.raw {
+						listen = stack.ListenRawPacket
+					}
+					conn, err := listen(t.Context(), socket.local)
+					if err != nil {
+						t.Fatal(err)
+					}
+					n, _, err = conn.ReadFrom(p[:])
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				if string(p[:n]) != test.want {
+					t.Fatalf("read %q, want %q", p[:n], test.want)
+				}
+			})
+		}
+	}
+}

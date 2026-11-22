@@ -504,8 +504,16 @@ guard it.
   `DialRawUDP`), where upstream's masks decode the start of the packet as a
   whole one. The QUIC transports, mKCP's dialer and WireGuard, which reject a
   damaged packet themselves, keep the plain socket (`ListenPacket`,
-  `DialUDP`). A mask that opens its own sockets (xdns, xicmp, udphop) reads
-  them as before.
+  `DialUDP`). The xdns server consumes DNS messages on the hub socket and keeps its
+  native read behavior. The xdns client, xicmp and udphop use their own sockets.
+  A pass-through mask preserves the hub's socket control messages. A decoded
+  header-mask datagram larger than the raw reader's destination is dropped.
+  An active sender can observe missing replies where a truncated prefix used
+  to draw a response, on both a masked hub and a masked outbound. Passive
+  observers may see different packet counts for that traffic. The xdns test
+  compares a valid zone-apex reply through the hub and the ordinary listener
+  and checks which socket the server reads. The Linux pass-through test checks
+  the original destination and physical peer.
   With `sockopt.dialerProxy` and no mask, freedom's connection is that link,
   which carries buffers and has a TCP address for UDP too. Upstream's freedom
   writes to it and reads it as a stream of bytes, so a datagram of 9000 bytes
@@ -525,13 +533,18 @@ guard it.
   `core.DialUDP` (`udp.DialDispatcher`) dispatches a datagram above 8192
   bytes in one buffer, where upstream's dispatches its first 8192 bytes as a
   whole one and reports a short write without an error, and drops a reply
-  longer than the read, where upstream's copies its start.
+  longer than the read, where upstream's copies its start. Both virtual
+  connections wait for the next fitting datagram or closure after a drop.
+  Their read deadlines do not interrupt that wait.
   Covered by `TestIsMessageTooLong`, `TestIsTruncated` and, on Windows,
   `TestIsMessageTooLongOnWindows` (`common/net`),
   `TestDatagramConnectionWritesEachPacketAsOneBuffer` and
   `TestDatagramConnectionReadDropsDatagramsLongerThanTheBuffer`
   (`common/net/cnc`),
   `TestDatagramReaderDropsDatagramsLongerThanABuffer` (`common/buf`),
+  `TestRawListenerPreservesXDNSServerPacketReads` and
+  `TestWholeDatagramConnDropsMessageTooLong` (`transport/internet/finalmask`),
+  `TestPassthroughFilterPreservesHubPacketMetadata`,
   `TestHubDropsDatagramsLongerThanItsBuffer`,
   `TestMaskedHubDropsDatagramsLongerThanItsBuffer`,
   `TestHubServesOnAfterAReadOfATooLongDatagram`,

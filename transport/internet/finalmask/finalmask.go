@@ -209,7 +209,7 @@ func (fm *FinalMask) dialUDPBelowMasks(ctx context.Context, dest net.Destination
 			conns = append(conns, newConn)
 		} else {
 			if len(conns) > 0 {
-				conn = &headerManagerConn{PacketConn: conn, sizes: sizes, conns: conns}
+				conn = &headerManagerConn{PacketConn: conn, sizes: sizes, conns: conns, whole: whole}
 				sizes = nil
 				conns = nil
 			}
@@ -222,7 +222,7 @@ func (fm *FinalMask) dialUDPBelowMasks(ctx context.Context, dest net.Destination
 		}
 	}
 	if len(conns) > 0 {
-		conn = &headerManagerConn{PacketConn: conn, sizes: sizes, conns: conns}
+		conn = &headerManagerConn{PacketConn: conn, sizes: sizes, conns: conns, whole: whole}
 		sizes = nil
 		conns = nil
 	}
@@ -248,6 +248,9 @@ func (fm *FinalMask) listenPacketBelowMasks(ctx context.Context, addr net.Addr, 
 		return fm.listenPacket(ctx, addr)
 	}
 	for i := range fm.udpMasks {
+		if _, ok := fm.udpMasks[i].(interface{ PreserveServerPacketReads() }); ok {
+			whole = false
+		}
 		if i > 0 {
 			if _, ok := fm.udpMasks[i].(interface{ HandleListen() }); ok {
 				return nil, fmt.Errorf("incorrect index: %d %T", i, fm.udpMasks[i])
@@ -283,7 +286,7 @@ func (fm *FinalMask) listenPacketBelowMasks(ctx context.Context, addr net.Addr, 
 			conns = append(conns, newConn)
 		} else {
 			if len(conns) > 0 {
-				conn = &headerManagerConn{PacketConn: conn, sizes: sizes, conns: conns}
+				conn = &headerManagerConn{PacketConn: conn, sizes: sizes, conns: conns, whole: whole}
 				sizes = nil
 				conns = nil
 			}
@@ -296,9 +299,13 @@ func (fm *FinalMask) listenPacketBelowMasks(ctx context.Context, addr net.Addr, 
 		}
 	}
 	if len(conns) > 0 {
-		conn = &headerManagerConn{PacketConn: conn, sizes: sizes, conns: conns}
+		conn = &headerManagerConn{PacketConn: conn, sizes: sizes, conns: conns, whole: whole}
 		sizes = nil
 		conns = nil
+	}
+	// The hub reads control messages itself when all masks pass through.
+	if raw, ok := conn.(*wholeDatagramConn); ok {
+		return raw.PacketConn, nil
 	}
 	return conn, nil
 }
@@ -312,6 +319,7 @@ type headerManagerConn struct {
 
 	sizes []int
 	conns []net.PacketConn
+	whole bool
 }
 
 func (c *headerManagerConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
@@ -353,6 +361,9 @@ func (c *headerManagerConn) ReadFrom(p []byte) (n int, addr net.Addr, err error)
 			continue
 		}
 
+		if c.whole && len(buf) > len(p) {
+			continue
+		}
 		return copy(p, buf), addr, nil
 	}
 }
