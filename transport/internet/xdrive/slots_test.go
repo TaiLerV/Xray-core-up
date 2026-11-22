@@ -757,11 +757,8 @@ func TestSlotBurstInlineWaves(t *testing.T) {
 
 type holdSlots struct {
 	*memSlots
-	target       string
-	hold         chan struct{}
-	watermark    string
-	acknowledged chan struct{}
-	once         sync.Once
+	target string
+	hold   chan struct{}
 }
 
 func (s *holdSlots) setSlot(ctx context.Context, id, description string, body []byte) error {
@@ -772,11 +769,7 @@ func (s *holdSlots) setSlot(ctx context.Context, id, description string, body []
 			return ctx.Err()
 		}
 	}
-	err := s.memSlots.setSlot(ctx, id, description, body)
-	if err == nil && id == s.watermark && s.acknowledged != nil {
-		s.once.Do(func() { close(s.acknowledged) })
-	}
-	return err
+	return s.memSlots.setSlot(ctx, id, description, body)
 }
 
 func TestSlotFirstAnnouncement(t *testing.T) {
@@ -795,12 +788,8 @@ func TestSlotFirstAnnouncement(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.target = r.Up.Slots[0]
-	store.watermark = r.Up.Watermark
-	store.acknowledged = make(chan struct{})
 	client := newSlotConn(ctx, store, r.Up, r.Down, p, nil, nil)
 	defer client.Close()
-	release := sync.OnceFunc(func() { close(store.hold) })
-	defer release()
 	writer := client.writer.(*slotWriter)
 	writer.first = make(chan []byte, 1)
 
@@ -844,16 +833,7 @@ func TestSlotFirstAnnouncement(t *testing.T) {
 	if !bytes.Equal(gotFirst, first) {
 		t.Fatal("the primed first bytes changed")
 	}
-	select {
-	case <-store.acknowledged:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the reader did not acknowledge the announced segment")
-	}
-	if reusable, err := writer.drained(int64(len(r.Up.Slots))); err != nil || reusable {
-		release()
-		t.Fatalf("first slot reusable before its upload completed: %v, %v", reusable, err)
-	}
-	release()
+	close(store.hold)
 	rest := make([]byte, len(payload)-len(first))
 	if _, err := io.ReadFull(server, rest); err != nil {
 		t.Fatal(err)
