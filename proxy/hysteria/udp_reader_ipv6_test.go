@@ -2,6 +2,7 @@ package hysteria
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
@@ -112,6 +113,54 @@ func TestUDPReaderDestinationsTrackAddressAndPort(t *testing.T) {
 		if destination.NetAddr() != want[index].NetAddr() || destination.Network != net.Network_UDP {
 			t.Fatalf("ReadFrom destination %d = %v, want %v", index, destination, want[index])
 		}
+	}
+}
+
+func TestUDPReaderFragmentedIPv6Destination(t *testing.T) {
+	for _, address := range udpReaderIPv6Addresses {
+		t.Run(address, func(t *testing.T) {
+			want, err := parseUDPDestination(address)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first := hysteriaUDPWire(address, []byte("first-"))
+			second := hysteriaUDPWire(address, []byte("second"))
+			for index, fragment := range [][]byte{first, second} {
+				binary.BigEndian.PutUint16(fragment[4:], 9)
+				fragment[6], fragment[7] = byte(index), 2
+			}
+			reader := func() *UDPReader {
+				return &UDPReader{reader: &sequentialDatagramReader{messages: [][]byte{first, second}}}
+			}
+			check := func(t *testing.T, payload []byte, got *net.Destination) {
+				t.Helper()
+				if string(payload) != "first-second" {
+					t.Errorf("reassembled payload = %q, want first-second", payload)
+				}
+				if got == nil || got.Network != want.Network || got.NetAddr() != want.NetAddr() || got.Address.Family() != want.Address.Family() {
+					t.Errorf("reassembled destination = %v, want %v", got, want)
+				}
+			}
+			t.Run("ReadMultiBuffer", func(t *testing.T) {
+				mb, err := reader().ReadMultiBuffer()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer buf.ReleaseMulti(mb)
+				if len(mb) != 1 {
+					t.Fatalf("got %d buffers, want one datagram", len(mb))
+				}
+				check(t, mb[0].Bytes(), mb[0].UDP)
+			})
+			t.Run("ReadFrom", func(t *testing.T) {
+				var payload [64]byte
+				n, got, err := reader().ReadFrom(payload[:])
+				if err != nil {
+					t.Fatal(err)
+				}
+				check(t, payload[:n], got)
+			})
+		})
 	}
 }
 

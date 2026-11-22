@@ -384,8 +384,9 @@ baseline and a candidate Xray server; it is a diagnostic, not part of
 IPv4 echo, one IPv6 echo, and four and sixteen IPv6 echoes in turn. It runs
 nine alternating rounds of 200,000 packets (`XRAY_HYSTERIA_UDP_PACKETS`) after
 a full-size settling load. It reports delivered packets per second and server
-CPU time per packet, summed from `/proc/<pid>/task/*/schedstat`; it fails if
-that file yields no CPU time. Losses above 1% fail the run, and with
+CPU time per packet, using the Linux process CPU clock, including exited threads.
+Each sample must record a positive CPU delta. The receiver counts each
+sequence once after checking its contents, relay and echo address. Losses above 1% fail the run, and with
 `XRAY_NATIVE_LINUX_RELEASE=1` so does a regression above 10%.
 `proxy/hysteria/BASELINE.md` records its results.
 

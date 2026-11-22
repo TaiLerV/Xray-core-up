@@ -2,6 +2,7 @@ package udp_test
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -86,5 +87,20 @@ func TestSameDestinationDispatching(t *testing.T) {
 	}
 	if v := atomic.LoadUint32(&msgCount); v != 6 {
 		t.Error("msgCount: ", v)
+	}
+}
+
+func TestDispatcherOwnsInitialRouteAddress(t *testing.T) {
+	var routed net.Destination
+	router := &TestDispatcher{OnDispatch: func(_ context.Context, dest net.Destination) (*transport.Link, error) {
+		routed = dest
+		return nil, errors.New("route unavailable")
+	}}
+	request := buf.New()
+	request.SetManagedUDPIPv4([4]byte{192, 0, 2, 7}, 5300)
+	NewDispatcher(router, nil).Dispatch(t.Context(), *request.UDP, request)
+	request.Release()
+	if routed.NetAddr() != "192.0.2.7:5300" {
+		t.Fatalf("routing destination after request release = %v", routed)
 	}
 }

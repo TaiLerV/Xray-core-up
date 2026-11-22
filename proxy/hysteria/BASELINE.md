@@ -43,8 +43,8 @@ Guarded by `udp_reader_ipv6_test.go`:
   fast parser accepts parses to the same destination on the slow path (60 s,
   2.78 M executions, no mismatch).
 
-`common/buf/writer_test.go` (`TestManagedUDPIPv6Metadata`) covers the slab
-field and its reset on release.
+`common/buf/writer_test.go` (`TestManagedUDPIPv6Metadata`) covers IPv6
+metadata and replacement with IPv4.
 
 ### Conditions
 
@@ -109,7 +109,10 @@ runs a baseline and a candidate server behind the same candidate Xray
 Hysteria client. The client sends 64-byte packets through one SOCKS UDP
 association, at most 32 in flight, to UDP echoes. There were nine
 alternating rounds of 200,000 packets after a full-size settling load, with
-no losses. The candidate was the production code of `45ef7a59`. The two
+no losses reported by the original receiver, which counted datagrams without
+validating their contents. CPU measurements below used the sum of live thread
+counters. The revised harness validates distinct echoes and reads the process
+CPU clock. The candidate was the production code of `45ef7a59`. The two
 runs, one after the other on an idle host:
 
 ```sh
@@ -135,6 +138,24 @@ delivered packets per second:
 | One IPv6 | 33015 (32834–33279) | 32730 (32472–32847) | −0.9% | 83733 / 84775 |
 | Four IPv6 in turn | 31814 (31712–32150) | 31502 (31263–31754) | −1.0% | 80965 / 81813 |
 | Sixteen IPv6 in turn | 32784 (32527–32965) | 31528 (31363–31695) | −3.8% | 77073 / 79163 |
+
+
+A diagnostic rerun on WSL2 with Go 1.27.3 used the revised receiver and
+process CPU clock, comparing `7795bd6c` with the working tree on
+`fdf6b1ba` before the initial UDP destination ownership change. The
+first command above ran with `CGO_ENABLED=0` and `GOFLAGS=-tags=http2legacy`.
+All 14.4 million measured packets returned with matching source, sequence
+and payload (four modes, nine rounds per server, 200,000 per sample).
+The table gives each baseline median followed by the candidate median.
+
+| Mode | Delivered packets/s | Server CPU ns/packet |
+| --- | ---: | ---: |
+| ipv4 | 62,541 / 68,670 | 37,284 / 35,859 |
+| ipv6-one | 70,914 / 77,149 | 36,393 / 34,704 |
+| ipv6-four | 49,324 / 52,827 | 41,991 / 38,688 |
+| ipv6-sixteen | 59,136 / 61,908 | 36,564 / 35,688 |
+
+The native Linux release budget was disabled for this WSL2 run.
 
 Server CPU per packet covers the whole round trip: QUIC, the upload reader,
 the download writer, the runtime, and its idle spinning in this closed loop.

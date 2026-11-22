@@ -16,6 +16,14 @@ func (*customIPv6Address) Domain() string        { panic("not a domain") }
 func (*customIPv6Address) Family() AddressFamily { return AddressFamilyIPv6 }
 func (a *customIPv6Address) String() string      { return "[" + a.IP().String() + "]" }
 
+// sliceIPv4 represents an address whose concrete value cannot be compared with ==.
+type sliceIPv4 []byte
+
+func (a sliceIPv4) IP() stdnet.IP       { return stdnet.IP(a) }
+func (sliceIPv4) Domain() string        { panic("not a domain") }
+func (sliceIPv4) Family() AddressFamily { return AddressFamilyIPv4 }
+func (a sliceIPv4) String() string      { return a.IP().String() }
+
 func TestAddressEqual(t *testing.T) {
 	ipv6 := [16]byte{0x20, 0x01, 0x0d, 0xb8, 15: 1}
 	custom := customIPv6Address(ipv6)
@@ -26,6 +34,8 @@ func TestAddressEqual(t *testing.T) {
 	}{
 		{name: "same IPv4", a: IPv4Address([4]byte{192, 0, 2, 1}), b: ParseAddress("192.0.2.1"), want: true},
 		{name: "different IPv4", a: IPv4Address([4]byte{192, 0, 2, 1}), b: ParseAddress("192.0.2.2")},
+		{name: "same slice address", a: sliceIPv4{192, 0, 2, 1}, b: sliceIPv4{192, 0, 2, 1}, want: true},
+		{name: "different slice address", a: sliceIPv4{192, 0, 2, 1}, b: sliceIPv4{192, 0, 2, 2}},
 		{name: "same IPv6", a: IPv6Address(ipv6), b: ParseAddress("2001:db8::1"), want: true},
 		{name: "IPv6 in its own type", a: &custom, b: IPv6Address(ipv6), want: true},
 		{name: "different IPv6 in its own type", a: &custom, b: ParseAddress("2001:db8::2")},

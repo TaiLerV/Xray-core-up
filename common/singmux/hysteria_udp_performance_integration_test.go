@@ -4,10 +4,11 @@ package singmux_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"io/fs"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -129,11 +129,11 @@ func (r hysteriaUDPLoadResult) packetsPerSecond() float64 {
 	return float64(r.received) / r.elapsed.Seconds()
 }
 
-func (r hysteriaUDPLoadResult) serverCPUPerPacket() time.Duration {
-	if r.received == 0 {
-		return 0
+func (r hysteriaUDPLoadResult) serverCPUPerPacket() (float64, error) {
+	if r.serverCPU <= 0 || r.received <= 0 {
+		return 0, fmt.Errorf("invalid CPU sample: %v for %d received packets", r.serverCPU, r.received)
 	}
-	return r.serverCPU / time.Duration(r.received)
+	return float64(r.serverCPU.Nanoseconds()) / float64(r.received), nil
 }
 
 func startHysteriaPerformanceTopology(t *testing.T, workDir string, binaries e2eBinaries, serverBinary, certificate, privateKey string, tcpEcho *net.TCPAddr, name string) *stressTopology {
@@ -190,7 +190,9 @@ func runHysteriaUDPLoad(t *testing.T, topology *stressTopology, targets []*net.U
 	for range hysteriaUDPLoadWindow {
 		tokens <- struct{}{}
 	}
-	var received atomic.Int64
+	seen := make([]bool, packets)
+	var sent, received atomic.Int64
+	var receiveErr error
 	var lastReceive atomic.Int64
 	receiverDone := make(chan struct{})
 	// Closing the socket ends the receiver on every exit path, t.Fatal
@@ -202,10 +204,21 @@ func runHysteriaUDPLoad(t *testing.T, topology *stressTopology, targets []*net.U
 	go func() {
 		defer close(receiverDone)
 		buffer := make([]byte, 2048)
+		relay := association.relay.AddrPort()
 		for received.Load() < int64(packets) {
-			_ = association.udp.SetReadDeadline(time.Now().Add(time.Second))
-			if _, _, err := association.udp.ReadFromUDP(buffer); err != nil {
+			if err := association.udp.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				receiveErr = err
 				return
+			}
+			n, peer, err := association.udp.ReadFromUDPAddrPort(buffer)
+			if err != nil {
+				if !errors.Is(err, os.ErrDeadlineExceeded) {
+					receiveErr = err
+				}
+				return
+			}
+			if peer.Port() != relay.Port() || peer.Addr().Unmap() != relay.Addr().Unmap() || !recordHysteriaReply(buffer[:n], targets, seen, int(sent.Load())) {
+				continue
 			}
 			received.Add(1)
 			lastReceive.Store(time.Now().UnixNano())
@@ -221,6 +234,13 @@ func runHysteriaUDPLoad(t *testing.T, topology *stressTopology, targets []*net.U
 	deadline := started.Add(hysteriaUDPLoadDeadline)
 	stall := time.NewTimer(time.Hour)
 	defer stall.Stop()
+	stopped := func(index int) {
+		t.Helper()
+		if receiveErr != nil {
+			t.Fatalf("read UDP replies after %d sent packets: %v", index, receiveErr)
+		}
+		t.Fatalf("UDP replies stopped after %d of %d sent packets (%d received)", index, packets, received.Load())
+	}
 	for index := range packets {
 		// Checked before every packet: replies that keep arriving just under
 		// the stall timeout would otherwise never reach the deadline.
@@ -230,19 +250,20 @@ func runHysteriaUDPLoad(t *testing.T, topology *stressTopology, targets []*net.U
 		select {
 		case <-tokens:
 		case <-receiverDone:
-			// The receiver stops early only when replies stopped for a
-			// second; waiting out the remaining packets would take hours.
-			t.Fatalf("UDP replies stopped after %d of %d sent packets (%d received)", index, packets, received.Load())
+			stopped(index)
 		default:
 			stall.Reset(200 * time.Millisecond)
 			select {
 			case <-tokens:
 			case <-stall.C:
 			case <-receiverDone:
-				t.Fatalf("UDP replies stopped after %d of %d sent packets (%d received)", index, packets, received.Load())
+				stopped(index)
 			}
 		}
-		if _, err := association.udp.WriteToUDP(datagrams[index%len(datagrams)], association.relay); err != nil {
+		datagram := datagrams[index%len(datagrams)]
+		binary.BigEndian.PutUint64(datagram[len(datagram)-hysteriaUDPLoadPayload:], uint64(index))
+		sent.Store(int64(index + 1))
+		if _, err := association.udp.WriteToUDP(datagram, association.relay); err != nil {
 			t.Fatalf("send packet %d: %v", index, err)
 		}
 	}
@@ -250,6 +271,9 @@ func runHysteriaUDPLoad(t *testing.T, topology *stressTopology, targets []*net.U
 	case <-receiverDone:
 	case <-time.After(time.Until(deadline) + 2*time.Second):
 		t.Fatalf("UDP sample exceeded %s waiting for replies (%d of %d received)", hysteriaUDPLoadDeadline, received.Load(), packets)
+	}
+	if receiveErr != nil {
+		t.Fatalf("read UDP replies: %v", receiveErr)
 	}
 	cpuAfter := processCPUTime(t, topology.server.command.Process.Pid)
 	result := hysteriaUDPLoadResult{
@@ -261,45 +285,29 @@ func runHysteriaUDPLoad(t *testing.T, topology *stressTopology, targets []*net.U
 	if result.received == 0 || result.elapsed <= 0 {
 		t.Fatalf("no UDP replies through the Hysteria path (%d sent)", packets)
 	}
+	if runtime.GOOS == "linux" && result.serverCPU <= 0 {
+		t.Fatalf("server CPU clock failed to advance: %v to %v", cpuBefore, cpuAfter)
+	}
 	return result
 }
 
-// processCPUTime returns the CPU time a process has run, summed over its
-// threads from /proc/<pid>/task/*/schedstat (nanoseconds).
-func processCPUTime(t *testing.T, pid int) time.Duration {
-	t.Helper()
-	if runtime.GOOS != "linux" {
-		return 0
+// recordHysteriaReply accepts one complete echo for each packet sent.
+func recordHysteriaReply(packet []byte, targets []*net.UDPAddr, seen []bool, sent int) bool {
+	source, payload, err := parseSOCKSUDPSource(packet)
+	if err != nil || len(payload) != hysteriaUDPLoadPayload || packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
+		return false
 	}
-	tasks, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
-	if err != nil {
-		t.Fatalf("list threads of %d: %v", pid, err)
+	sequence := binary.BigEndian.Uint64(payload)
+	if sequence >= uint64(sent) || seen[sequence] {
+		return false
 	}
-	var total time.Duration
-	for _, task := range tasks {
-		content, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%s/schedstat", pid, task.Name()))
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
-			continue // the thread exited
-		}
-		if err != nil {
-			t.Fatalf("read schedstat of thread %s of %d: %v", task.Name(), pid, err)
-		}
-		fields := strings.Fields(string(content))
-		if len(fields) == 0 {
-			t.Fatalf("empty schedstat of thread %s of %d", task.Name(), pid)
-		}
-		nanoseconds, err := strconv.ParseInt(fields[0], 10, 64)
-		if err != nil {
-			t.Fatalf("parse schedstat of thread %s: %v", task.Name(), err)
-		}
-		total += time.Duration(nanoseconds)
+	want := targets[int(sequence)%len(targets)].AddrPort()
+	var padding [hysteriaUDPLoadPayload - 8]byte
+	if source != netip.AddrPortFrom(want.Addr().Unmap(), want.Port()) || !bytes.Equal(payload[8:], padding[:]) {
+		return false
 	}
-	// A kernel without CONFIG_SCHED_INFO reports nothing here; a zero would
-	// make the CPU ratio NaN and pass the budget check unmeasured.
-	if total <= 0 {
-		t.Fatalf("no CPU time for process %d in /proc/%d/task/*/schedstat", pid, pid)
-	}
-	return total
+	seen[sequence] = true
+	return true
 }
 
 func medianFloat(samples []float64) float64 {
@@ -313,7 +321,13 @@ func reportHysteriaUDPLoad(t *testing.T, mode string, baseline, candidate []hyst
 	summarize := func(samples []hysteriaUDPLoadResult) (pps, cpu []float64, lost int) {
 		for _, sample := range samples {
 			pps = append(pps, sample.packetsPerSecond())
-			cpu = append(cpu, float64(sample.serverCPUPerPacket().Nanoseconds()))
+			if runtime.GOOS == "linux" {
+				value, err := sample.serverCPUPerPacket()
+				if err != nil {
+					t.Fatal(err)
+				}
+				cpu = append(cpu, value)
+			}
 			lost += sample.sent - sample.received
 		}
 		return pps, cpu, lost
@@ -328,12 +342,12 @@ func reportHysteriaUDPLoad(t *testing.T, mode string, baseline, candidate []hyst
 		return strings.Join(parts, " ")
 	}
 	ppsRatio := medianFloat(candidatePPS) / medianFloat(baselinePPS)
-	cpuRatio := medianFloat(candidateCPU) / medianFloat(baselineCPU)
-	t.Logf("%s pps baseline=[%s] candidate=[%s]", mode, format(baselinePPS), format(candidatePPS))
-	t.Logf("%s server CPU ns/packet baseline=[%s] candidate=[%s]", mode, format(baselineCPU), format(candidateCPU))
-	t.Logf("%s median pps baseline=%.0f candidate=%.0f ratio=%.3f; server CPU ns/packet baseline=%.0f candidate=%.0f ratio=%.3f; lost baseline=%d candidate=%d of %d each",
-		mode, medianFloat(baselinePPS), medianFloat(candidatePPS), ppsRatio, medianFloat(baselineCPU), medianFloat(candidateCPU), cpuRatio,
-		baselineLost, candidateLost, baseline[0].sent*len(baseline))
+	t.Logf("%s pps baseline=[%s] candidate=[%s] ratio=%.3f; lost baseline=%d candidate=%d", mode, format(baselinePPS), format(candidatePPS), ppsRatio, baselineLost, candidateLost)
+	var cpuRatio float64
+	if runtime.GOOS == "linux" {
+		cpuRatio = medianFloat(candidateCPU) / medianFloat(baselineCPU)
+		t.Logf("%s server CPU ns/packet baseline=[%s] candidate=[%s] ratio=%.3f", mode, format(baselineCPU), format(candidateCPU), cpuRatio)
+	}
 	total := 0
 	for _, sample := range baseline {
 		total += sample.sent
@@ -350,5 +364,45 @@ func reportHysteriaUDPLoad(t *testing.T, mode string, baseline, candidate []hyst
 	}
 	if cpuRatio > 1.10 {
 		t.Errorf("%s candidate server CPU per packet regression %.1f%% exceeds 10%%", mode, (cpuRatio-1)*100)
+	}
+}
+
+func TestHysteriaLoadCountsDistinctEchoes(t *testing.T) {
+	targets := []*net.UDPAddr{{IP: net.IPv4(127, 0, 0, 1), Port: 53}, {IP: net.IPv6loopback, Port: 54}}
+	seen := make([]bool, 3)
+	reply := func(sequence uint64, target int) []byte {
+		header := appendSOCKSUDPAddress([]byte{0, 0, 0}, targets[target])
+		payload := make([]byte, hysteriaUDPLoadPayload)
+		binary.BigEndian.PutUint64(payload, sequence)
+		return append(header, payload...)
+	}
+	corrupt := reply(0, 0)
+	corrupt[len(corrupt)-1] = 1
+	for _, tc := range []struct {
+		name string
+		wire []byte
+		want bool
+	}{
+		{"truncated", []byte{0, 0}, false},
+		{"wrong target", reply(1, 0), false},
+		{"corrupted payload", corrupt, false},
+		{"unsent", reply(2, 0), false},
+		{"out of order", reply(1, 1), true},
+		{"duplicate", reply(1, 1), false},
+		{"first", reply(0, 0), true},
+	} {
+		if got := recordHysteriaReply(tc.wire, targets, seen, 2); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestHysteriaCPUPerPacketRequiresMeasurement(t *testing.T) {
+	for _, cpu := range []time.Duration{-time.Second, 0, 1} {
+		result := hysteriaUDPLoadResult{received: 2, serverCPU: cpu}
+		value, err := result.serverCPUPerPacket()
+		if (err == nil) != (cpu > 0) || cpu > 0 && value != 0.5 {
+			t.Errorf("CPU %v: got %v ns/packet, %v", cpu, value, err)
+		}
 	}
 }

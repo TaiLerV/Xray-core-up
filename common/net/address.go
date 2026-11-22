@@ -173,10 +173,10 @@ func AddressToNetIPAddr(address Address) (netip.Addr, bool) {
 // hold them. Packet buffers keep UDP addresses in their own types, which never
 // compare equal with == to the values this package creates.
 func AddressEqual(a, b Address) bool {
-	if a == b {
-		return true
+	if a == nil || b == nil {
+		return a == nil && b == nil
 	}
-	if a == nil || b == nil || a.Family() != b.Family() {
+	if a.Family() != b.Family() {
 		return false
 	}
 	if a.Family().IsDomain() {
@@ -200,7 +200,7 @@ func OwnedAddress(a Address) Address {
 		return a
 	}
 	if a.Family().IsDomain() {
-		return DomainAddress(a.Domain())
+		return DomainAddress(strings.Clone(a.Domain()))
 	}
 	return IPAddress(a.IP())
 }

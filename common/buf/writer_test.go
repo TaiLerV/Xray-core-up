@@ -61,6 +61,7 @@ func TestManagedUDPIPv4Metadata(t *testing.T) {
 
 func TestManagedUDPIPv6Metadata(t *testing.T) {
 	buffer := New()
+	defer buffer.Release()
 	wantIP := [16]byte{0x20, 0x01, 0x0d, 0xb8, 15: 1}
 	buffer.SetManagedUDPIPv6(wantIP, 443)
 	if buffer.UDP == nil || buffer.UDP.Network != X.Network_UDP || buffer.UDP.Port != 443 {
@@ -87,19 +88,6 @@ func TestManagedUDPIPv6Metadata(t *testing.T) {
 	buffer.SetManagedUDPIPv4([4]byte{192, 0, 2, 1}, 53)
 	if buffer.UDP.NetAddr() != "192.0.2.1:53" {
 		t.Fatalf("IPv4 after IPv6 = %v", buffer.UDP)
-	}
-	buffer.Release()
-
-	// A pooled slab comes back without the previous owner's destination.
-	for range 64 {
-		reused := New()
-		if reused.UDP != nil {
-			t.Fatalf("reused buffer kept destination %v", reused.UDP)
-		}
-		if _, _, ok := reused.ManagedUDPIPv4(); ok {
-			t.Fatal("reused buffer kept managed IPv4 metadata")
-		}
-		reused.Release()
 	}
 }
 

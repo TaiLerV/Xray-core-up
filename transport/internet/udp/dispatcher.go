@@ -107,6 +107,7 @@ func (v *Dispatcher) getInboundRay(ctx context.Context, dest net.Destination) (*
 
 func (v *Dispatcher) Dispatch(ctx context.Context, destination net.Destination, payload *buf.Buffer) {
 	// TODO: Add user to destString
+	destination = ownedDestination(destination)
 	errors.LogDebug(ctx, "dispatch request to: ", destination)
 
 	conn, err := v.getInboundRay(ctx, destination)
@@ -137,7 +138,6 @@ func ownedDestination(destination net.Destination) net.Destination {
 }
 
 func handleInput(ctx context.Context, conn *connEntry, dest net.Destination, callback ResponseCallback, callClose func() error) {
-	dest = ownedDestination(dest)
 	defer func() {
 		conn.Close()
 		if callClose != nil {

@@ -47,6 +47,20 @@ func TestServerTCPDestinationSurvivesRequestRelease(t *testing.T) {
 	}
 }
 
+func TestOwnedDomainOutlivesServerRequestBytes(t *testing.T) {
+	request := acquireServerTCPRequest()
+	defer releaseServerTCPRequest(request)
+	length := copy(request.buffer[:], "first.example:443")
+	if err := request.parseDestination(request.buffer[:length]); err != nil {
+		t.Fatal(err)
+	}
+	owned := net.OwnedAddress(request.destination.Address)
+	copy(request.buffer[:], "other.example:443")
+	if got := owned.Domain(); got != "first.example" {
+		t.Fatalf("owned domain after request buffer reuse = %q, want first.example", got)
+	}
+}
+
 func TestServerUDPDestinationSurvivesLaterPackets(t *testing.T) {
 	for _, packet := range []udpPacketDestination{
 		{domain: "example.com", port: 53, isDomain: true},

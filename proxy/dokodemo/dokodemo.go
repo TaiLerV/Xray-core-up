@@ -234,6 +234,9 @@ type PacketWriter struct {
 // packetWriterKey returns the IP and port of an IP destination.
 func packetWriterKey(destination net.Destination) (netip.AddrPort, bool) {
 	ip, ok := net.AddressToNetIPAddr(destination.Address)
+	if !ok && destination.Address != nil && destination.Address.Family().IsIP() {
+		ip, ok = netip.AddrFromSlice(destination.Address.IP())
+	}
 	if !ok {
 		return netip.AddrPort{}, false
 	}

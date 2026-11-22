@@ -10,6 +10,9 @@ import (
 	"github.com/xtls/xray-core/common/net"
 )
 
+// addressOnly exposes the required Address methods without the optional NetIPAddr method.
+type addressOnly struct{ net.Address }
+
 // recordingPacketConn counts the datagrams written to it.
 type recordingPacketConn struct {
 	mu     sync.Mutex
@@ -51,6 +54,9 @@ func TestPacketWriterReusesTargetSocketForSlabAddresses(t *testing.T) {
 	}{
 		{name: "ipv4", target: net.UDPDestination(net.IPv4Address(ipv4), 443), set: func(b *buf.Buffer) { b.SetManagedUDPIPv4(ipv4, 443) }},
 		{name: "ipv6", target: net.UDPDestination(net.IPv6Address(ipv6), 443), set: func(b *buf.Buffer) { b.SetManagedUDPIPv6(ipv6, 443) }},
+		{name: "IP without NetIPAddr", target: net.UDPDestination(net.IPv6Address(ipv6), 443), set: func(b *buf.Buffer) {
+			b.SetManagedUDPDestination(net.UDPDestination(addressOnly{net.IPv6Address(ipv6)}, 443))
+		}},
 		{name: "plain", target: net.UDPDestination(net.IPv6Address(ipv6), 443), set: func(b *buf.Buffer) {
 			b.SetManagedUDPDestination(net.UDPDestination(net.IPv6Address(ipv6), 443))
 		}},
