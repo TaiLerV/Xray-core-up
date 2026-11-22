@@ -404,6 +404,13 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		if hasPhysicalPeer || hasAcceptedProxyPeer {
 			virtualConn = net.WithPeerProvenance(physicalPeer, acceptedProxyPeer, virtualConn)
 		}
+		// The worker serves the connection inline, so addConn returns only once
+		// the session is over and the select below cannot see the GET end.
+		// Close the connection when the request ends: a reader of the upload
+		// queue would otherwise wait for packets nobody sends, and a Mux.Cool
+		// worker holding an XUDP flow is never idle enough to end it.
+		stopCloseOnDone := context.AfterFunc(request.Context(), func() { conn.Close() })
+		defer stopCloseOnDone()
 		h.ln.addConn(stat.Connection(virtualConn))
 
 		// "A ResponseWriter may not be used after [Handler.ServeHTTP] has returned."
@@ -584,7 +591,22 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			}
 		}
 		if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
-			l.listener = goreality.NewListener(l.listener, config.GetREALITYConfig())
+			// The HTTP/2 server sends what the target sends after the
+			// handshake, shaped as the target's records, see shapeConn.
+			realityConfig := config.GetREALITYConfig()
+			realityConfig.AppRecords = realityConfig.BrowserMode
+			l.listener = goreality.NewListener(l.listener, realityConfig)
+			if realityConfig.AppRecords {
+				shaped := &shapeListener{Listener: l.listener}
+				l.listener = shaped
+				if !l.config.h2FlowOn() {
+					// net/http accumulates small increments instead of
+					// sending a standalone bootstrap frame.
+					if grant := h2ConnWindow(http2Config) - h2InitWindow; grant >= 4<<10 {
+						shaped.startupGrant = uint32(grant)
+					}
+				}
+			}
 		}
 
 		handler.localAddr = l.listener.Addr()

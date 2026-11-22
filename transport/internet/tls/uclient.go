@@ -44,6 +44,13 @@ type UClientOption func(*uClientOptions)
 
 type uClientOptions struct {
 	http11ALPN bool
+	spec       *utls.ClientHelloSpec
+}
+
+func WithClientHelloSpec(spec *utls.ClientHelloSpec) UClientOption {
+	return func(options *uClientOptions) {
+		options.spec = spec
+	}
 }
 
 // WithHTTP11ALPN gives the ClientHello the ALPN of the WebSocket and
@@ -94,8 +101,33 @@ func newUClient(c net.Conn, config *utls.Config, fingerprint utls.ClientHelloID,
 	// Read before the hello is built: applying a fingerprint replaces
 	// config.NextProtos with the fingerprint's own ALPN.
 	alpn := http11ALPN(config.NextProtos)
+	if len(config.EncryptedClientHelloConfigList) > 0 && (settings.spec != nil || fingerprint != utls.HelloGolang) {
+		// A ticket belongs in the inner hello, where uTLS cannot put it for
+		// a fingerprint or a custom spec: it fails to build a hello that
+		// offers one next to real ECH. HelloGolang alone is Go's own
+		// client, which can.
+		resumption = clientSessionResumption{}
+		config.ClientSessionCache = nil
+	}
 
-	uConn := resumption.client(c, config, fingerprint)
+	var uConn *utls.UConn
+	switch {
+	case settings.spec != nil:
+		uConn = utls.UClient(c, config, utls.HelloCustom)
+		if err := uConn.ApplyPreset(settings.spec); err != nil {
+			return nil, err
+		}
+	case BuildsFirefoxClientHello(fingerprint, config.ServerName):
+		if resumption.source != nil {
+			config.ClientSessionCache = resumption.sessionCache(fingerprint)
+		}
+		var err error
+		if uConn, err = newFirefoxClient(c, config, fingerprint); err != nil {
+			return nil, err
+		}
+	default:
+		uConn = resumption.client(c, config, fingerprint)
+	}
 	if err := uConn.BuildHandshakeState(); err != nil {
 		return nil, err
 	}
@@ -113,6 +145,7 @@ func newUClient(c net.Conn, config *utls.Config, fingerprint utls.ClientHelloID,
 			config.NextProtos = []string{"http/1.1"}
 		} else {
 			setALPN(uConn, alpn)
+			keepALPSWithinALPN(uConn, alpn)
 			rebuild = true
 		}
 	}
@@ -122,6 +155,35 @@ func newUClient(c net.Conn, config *utls.Config, fingerprint utls.ClientHelloID,
 		}
 	}
 	return uConn, nil
+}
+
+// keepALPSWithinALPN leaves application settings only for protocols the
+// hello offers, and no ALPS extension when none is left. Chromium adds ALPS
+// for the protocols it puts in ALPN, and BoringSSL sends no extension
+// without one, so a hello that offers http/1.1 alone carries no ALPS for h2.
+func keepALPSWithinALPN(uConn *utls.UConn, alpn []string) {
+	offered := func(protocols []string) []string {
+		return slices.DeleteFunc(slices.Clone(protocols), func(protocol string) bool {
+			return !slices.Contains(alpn, protocol)
+		})
+	}
+	extensions := make([]utls.TLSExtension, 0, len(uConn.Extensions))
+	for _, extension := range uConn.Extensions {
+		switch settings := extension.(type) {
+		case *utls.ApplicationSettingsExtension:
+			settings.SupportedProtocols = offered(settings.SupportedProtocols)
+			if len(settings.SupportedProtocols) == 0 {
+				continue
+			}
+		case *utls.ApplicationSettingsExtensionNew:
+			settings.SupportedProtocols = offered(settings.SupportedProtocols)
+			if len(settings.SupportedProtocols) == 0 {
+				continue
+			}
+		}
+		extensions = append(extensions, extension)
+	}
+	uConn.Extensions = extensions
 }
 
 // dropKeyShare removes the key share for group from the hello and reports

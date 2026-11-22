@@ -171,7 +171,9 @@ func (c *serializingUTLSSessionCache) Put(sessionKey string, session *utls.Clien
 	defer c.Unlock()
 
 	if session == nil {
-		c.cache.Put(sessionKey, nil)
+		// uTLS drops the ticket of a handshake that failed. Get took that
+		// ticket out when it was offered; what is here now is a newer one
+		// that another connection stored.
 		return
 	}
 	if cloned := cloneUTLSSession(session); cloned != nil {
@@ -208,21 +210,37 @@ func reportUnresumableFingerprint(fingerprint utls.ClientHelloID) {
 	if _, reported := reportedUnresumableFingerprints.LoadOrStore(name, struct{}{}); reported {
 		return
 	}
+	if followsNSS(fingerprint) {
+		errors.LogInfo(context.Background(), "TLS session resumption is unavailable for fingerprint ", name,
+			" without a server name: what Firefox sends to an IP address when it resumes was not measured")
+		return
+	}
 	errors.LogInfo(context.Background(), "TLS session resumption is unavailable for fingerprint ", name,
 		": its ClientHello does not advertise session_ticket and psk_key_exchange_modes, ",
 		"and adding them would not match the impersonated client")
 }
 
-// SupportsSessionResumption reports whether a resumption PSK can be offered
-// under the given fingerprint without altering its ClientHello.
+// SupportsSessionResumption reports whether a session can be resumed under
+// the given fingerprint with the ClientHello its browser sends for it: its
+// template plus pre_shared_key, or for a Firefox that followsNSS the hello
+// newFirefoxClient builds.
 func SupportsSessionResumption(fingerprint utls.ClientHelloID) bool {
+	if followsNSS(fingerprint) {
+		return true
+	}
 	_, eligible := clientHelloSpecForResumption(fingerprint)
 	return eligible
 }
 
 // clientHelloSpecForResumption returns a ClientHello template able to carry a
-// resumption PSK, or false when preserving the stock fingerprint wins.
+// resumption PSK, or false when preserving the stock fingerprint wins. A
+// Firefox that followsNSS changes more than pre_shared_key when it resumes:
+// its template plus pre_shared_key is a ClientHello it never sends, and
+// newFirefoxClient builds the one it does.
 func clientHelloSpecForResumption(fingerprint utls.ClientHelloID) (*utls.ClientHelloSpec, bool) {
+	if followsNSS(fingerprint) {
+		return nil, false
+	}
 	spec, err := utls.UTLSIdToSpec(fingerprint)
 	if err != nil {
 		return nil, false

@@ -113,6 +113,11 @@ func decideHTTPVersion(tlsConfig *tls.Config, realityConfig *reality.Config) str
 	return "2"
 }
 
+// handshakeTimeout bounds a client's TLS or REALITY handshake: one
+// blackholed after ClientHello would hold every request queued behind its
+// dial.
+const handshakeTimeout = 10 * time.Second
+
 func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStreamConfig) DialerClient {
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
@@ -142,19 +147,39 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			return nil, err
 		}
 
+		ctxInner, cancel := context.WithTimeout(ctxInner, handshakeTimeout)
+		defer cancel()
+		// name the handshake and its bound in the log, which otherwise reads
+		// only "context deadline exceeded"
+		handshakeError := func(err error) error {
+			if ctxInner.Err() == context.DeadlineExceeded {
+				return errors.New("XHTTP: TLS handshake did not finish in ", handshakeTimeout).Base(err)
+			}
+			return err
+		}
+
 		if realityConfig != nil {
-			return reality.UClient(conn, realityConfig, ctxInner, dest)
+			uConn, err := reality.UClient(conn, realityConfig, ctxInner, dest)
+			if err != nil {
+				return nil, handshakeError(err)
+			}
+			return uConn, nil
 		}
 
 		if gotlsConfig != nil {
 			if fingerprint := tls.GetFingerprint(tlsConfig.Fingerprint); fingerprint != nil {
 				uConn, err := tls.ClientHandshake(ctxInner, conn, gotlsConfig, fingerprint)
 				if err != nil {
-					return nil, err
+					return nil, handshakeError(err)
 				}
 				conn = uConn
 			} else {
-				conn = tls.Client(conn, gotlsConfig)
+				tlsConn := tls.Client(conn, gotlsConfig).(*tls.Conn)
+				if err := tlsConn.HandshakeContext(ctxInner); err != nil {
+					tlsConn.Close()
+					return nil, handshakeError(err)
+				}
+				conn = tlsConn
 			}
 		}
 
@@ -267,13 +292,22 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			keepAlivePeriod = 0
 		}
 		governed := transportConfig.h2FlowOn()
+		browserProfile := realityConfig.UsesBrowserProfile()
 		h2 := newH2Transport(transportConfig.h2ReceiveConfig(false))
 		h2.DialTLSContext = func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
 			conn, err := dialContext(ctxInner)
-			if err != nil || !governed {
+			if err != nil {
 				return conn, err
 			}
-			return newFlowClientConn(conn), nil
+			if browserProfile {
+				conn = &ackConn{Conn: conn, prefaceLeft: len(h2Preface)}
+			}
+			if !governed {
+				return conn, nil
+			}
+			client := newFlowClientConn(conn)
+			client.shapeStartup = browserProfile
+			return client, nil
 		}
 		h2.IdleConnTimeout = net.ConnIdleTimeout
 		h2.ReadIdleTimeout = keepAlivePeriod
