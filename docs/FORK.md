@@ -21,9 +21,9 @@ guard it.
   strips the hybrid group whatever the fingerprint; Mihomo v1.19.32 with
   default options, where by its source only `chrome` with
   `reality-opts.support-x25519mlkem768: true` keeps it (not run); Xray
-  `edge`, `ios`, `qq` and the older `hello*` forms. Xray `chrome`, `firefox`,
-  `safari`, their current `hello*` forms, `randomized` and
-  `randomizednoalpn` pass. Xray `random` depends on the fingerprint drawn at
+  `ios`, `qq` and the older `hello*` forms, `helloedge_85` and
+  `helloedge_106` among them. Xray `chrome`, `firefox`, `safari`, `edge`,
+  their current `hello*` forms, `randomized` and `randomizednoalpn` pass. Xray `random` depends on the fingerprint drawn at
   process start and passes on some starts only. `android` and `360` have no TLS 1.3
   and work in neither mode. Field 100 (`require_mlkem`) of the REALITY
   `Config` message is fork-owned and outside upstream's blocks (1-13 server,
@@ -49,14 +49,29 @@ guard it.
   `WithHTTP11ALPN` replaces upstream's `WebsocketHandshakeContext` without
   reading uTLS's private config; for a fingerprint without ALPN it adds the
   extension before `pre_shared_key`, where upstream appends it after, which
-  breaks a handshake that resumes a session. The `randomized` and
+  breaks a handshake that resumes a session. It also drops the
+  fingerprint's ALPS for a protocol the hello no longer offers, and the
+  extension with it when none is left: Chromium adds ALPS for the protocols
+  it puts in ALPN, so a WebSocket or HTTPUpgrade hello that offers http/1.1
+  alone carries no ALPS, where upstream keeps ALPS for h2 next to it
+  (`TestHelloOffersALPSOnlyForItsALPN`). The `randomized` and
   `randomizednoalpn` presets always offer X25519MLKEM768 with its key share
   and send key shares for X25519MLKEM768 and X25519 only; upstream draws the
   hybrid group and its key share independently, so a process could start
   with a hello that REALITY rejects, that a post-quantum-preferring server
   answers with a HelloRetryRequest uTLS cannot follow, or that breaks RFC
   8446, Section 4.2.8; the P-256 key share upstream may add is dropped, as
-  Chrome sends none. The raw `hellorandomized*` forms keep uTLS's behavior. The
+  Chrome sends none. The raw `hellorandomized*` forms keep uTLS's behavior.
+  With a real ECH config list no fingerprint offers a session ticket: the
+  ticket belongs in the inner hello, uTLS cannot put it there for a
+  fingerprint, and it refuses to build a hello that offers one. That failed
+  the dial when the cache held a ticket from a connection made without
+  ECH; a Go server answering ECH issued no ticket in the tests, so two ECH
+  connections in a row did not show it. A caller of `NewUClient` that
+  brings its own session cache keeps it for `utls.HelloGolang`, Go's own
+  client, which can carry the ticket; through Xray's TLS settings
+  `hellogolang` did not resume with ECH before and does not now
+  (`TestRealECHOffersNoTicket`, `TestRealECHKeepsGoClientSessionCache`). The
   REALITY client builds its hello the same way, returns an error instead of
   panicking for a fingerprint whose hello cannot carry the session ID (the
   `*_psk` forms), reads the server's certificates through `VerifyConnection`
@@ -75,20 +90,164 @@ guard it.
   `transport/internet/reality/randomized_test.go` and
   `transport/internet/grpc/dial_test.go`.
 - uTLS comes from the fork `github.com/Jolymmiles/utls`, branch
-  `fix/keep-secondary-key-shares-a13c59f` (a `replace` in `go.mod`; the
-  module path stays `github.com/refraction-networking/utls`): upstream
-  `a13c59ffe98b`, the commit upstream Xray pins since v26.11.9, plus the
-  changes listed in the fork's `FORK.md`. It keeps the private keys of the
-  classical key shares after the first and uses the one the server selected,
-  so `firefox` and the `hellofirefox_*` forms, which send key shares for
-  X25519 and P-256, complete a handshake with a server that selects P-256;
-  upstream fails it with "tls: invalid server key share"
-  (refraction-networking/utls#402), right after the ServerHello and in
-  cleartext, where Firefox goes on. The ClientHello is unchanged. It is a
-  backport of refraction-networking/utls#416; drop the fork once upstream
-  ships the fix. Covered by `transport/internet/tls/fingerprint_health_test.go`,
-  the ClientHello snapshot tests and the fork's
-  `TestSecondaryKeyShareSelectedByServer`.
+  `fix/keep-secondary-key-shares-a13c59f` at `f03e50a18427` (a `replace` in
+  `go.mod`; the module path stays `github.com/refraction-networking/utls`):
+  upstream `a13c59ffe98b`, the commit upstream Xray pins since v26.11.9,
+  plus the changes listed in the fork's `FORK.md`:
+  - It keeps the private keys of the classical key shares after the first
+    and uses the one the server selected, so `firefox` and the
+    `hellofirefox_*` forms, which send key shares for X25519 and P-256,
+    complete a handshake with a server that selects P-256; upstream fails it
+    with "tls: invalid server key share" (refraction-networking/utls#402),
+    right after the ServerHello and in cleartext, where Firefox goes on.
+    This change leaves the ClientHello as it is. It is a backport of
+    refraction-networking/utls#416; drop it once upstream ships the fix.
+  - `firefox` and `hellofirefox_auto` select `HelloFirefox_156`, and `edge`
+    and `helloedge_auto` select `HelloEdge_157`; upstream's are Firefox 148
+    and Edge 85. The fork compares both, and `safari`'s preset, with a raw
+    ClientHello captured from the browser. Edge 157 sends about 1 800 bytes
+    with an X25519MLKEM768 key share, GREASE ECH and ALPS, and offers TLS
+    1.2 and 1.3 only; Edge 85 sent 517 bytes and offered TLS 1.0 and 1.1 as
+    well. `hellofirefox_148`, `helloedge_85` and `helloedge_106` select the
+    older presets as before.
+  - The Chrome presets draw every swap of their extension shuffle from
+    `crypto/rand`, as BoringSSL does. Upstream seeds one `math/rand` source
+    per hello, which reaches at most 2^31-1 of the 17! orders, and leaves
+    each extension in its source slot in about 11% of hellos.
+  - `firefox` and `hellofirefox_auto` do not send the preset as it is.
+    `transport/internet/tls/firefox.go` builds Firefox 156's ClientHello for
+    each connection, for the TLS transports and for REALITY alike, by rules
+    measured on Firefox 156.0.1 and 160.0 (340 ClientHellos; five are kept
+    in `transport/internet/tls/testdata/firefox`):
+    - the GREASE ECH payload is 16 bytes more than the sum of 117, the
+      server name padded to 100 and the `pre_shared_key` extension, rounded
+      up to 32, so the extension grows from 282 bytes once the server name
+      passes 107 bytes, where the preset has 282 at any length;
+    - its encapsulated key is 32 random bytes, as in NSS, where uTLS puts
+      an X25519 public key, whose last byte never has its top bit set;
+    - with a TLS 1.3 ticket it leaves `session_ticket` out and offers the
+      ticket in a `pre_shared_key` that comes last; with a TLS 1.2 ticket
+      the ticket goes into `session_ticket` and nothing else changes.
+
+    So `firefox` resumes sessions where the TLS settings allow it, which
+    the preset plus `pre_shared_key` could not do without sending a hello
+    Firefox does not send. The ticket is taken from the cache before the
+    hello is built, because the hello depends on it. Xray's caches give a
+    ticket to one connection, so it is offered once, as Firefox does; a
+    session cache a caller of `NewUClient` brings keeps its own policy. In
+    the cache behind the TLS settings, for any fingerprint, a connection
+    that fails after it offered a ticket leaves the newer ticket another
+    connection has stored since, for the next connection to offer: uTLS
+    drops the failed handshake's ticket by server name, and that cache had
+    given it up already (`TestFailedDialKeepsANewerTicket`). REALITY keeps
+    its own rule: a failed offer clears the server's tickets and holds new
+    offers back for ten minutes.
+    Limits: Firefox also
+    sends `early_data` when a ticket allows it, and Xray, which sends no
+    early data, does not, as Firefox with `security.tls.enable_0rtt_data`
+    off: an observer of a server that allows early data sees neither
+    extension 42 nor early records, and at some sizes a GREASE ECH 32 bytes
+    shorter; a connection to an IP address, which carries no server name,
+    was not measured: over the TLS transports it sends the preset without
+    resuming, and in REALITY's browser mode it resumes with the
+    approximation of `transport/internet/reality/resumption.go`; a ticket
+    too long for the hello to carry is dropped; the older
+    `hellofirefox_*` presets keep their templates and the rule of
+    `resumptionSpec`.
+
+  Covered by `transport/internet/tls/fingerprint_health_test.go`, the
+  ClientHello snapshot tests, `TestFirefoxClientHelloFollowsCaptures`,
+  `TestFirefoxGREASEECHFields`, `TestFirefoxGREASEECHCountsTheTicketItOffers`,
+  `TestFirefoxOffersATicketOnce`, `TestFirefoxTicketTooLongForTheHello`,
+  `TestUClientSessionResumptionFirefox`,
+  `TestFirefoxResumptionHelloCountsALongServerName`,
+  `TestFirefox156ResumesOnlyWithItsOwnHello`,
+  `TestREALITYRequireMlkemAcceptsEdge` and the fork's capture and key-share
+  tests.
+- REALITY browser mode requires `"browser": "auto"` on the inbound and
+  outbound. The default disables the new target probes, session-ticket
+  behavior and XHTTP startup shaping. A client with browser mode off
+  keeps the legacy server connection path even on an enabled inbound.
+  Ticket encryption and the stateful cache are scoped to the server's
+  X25519 and configured ML-DSA private keys and to the process: the ticket
+  key mixes in a random value drawn at startup. Adding, rotating, or
+  removing the ML-DSA key, or restarting the process, invalidates existing
+  tickets, and replicas with the same keys do not accept each other's.
+  Field 101 (`browser`) is fork-owned. Binary protobuf configurations
+  from the review revision that used field 28 must be regenerated from
+  their JSON source.
+  An authenticated resumed ClientHello is accepted once: the server
+  records it before the handshake, and a repeat goes to the destination,
+  which answers it with a full handshake. A stock TLS server resumes a
+  repeat of its own resumed ClientHello again (crypto/tls and OpenSSL both
+  answer `[43 51 41]` twice), so a censor who replays one sees REALITY
+  answer `[43 51 41]`, then `[43 51]`. The history is one process-wide
+  cache of 40,000 entries and empty after a restart. A ticket it cannot
+  vouch for is not resumed, and its ClientHello gets REALITY's full
+  handshake, `[43 51]` as from the target. A ticket from before a restart
+  or from another replica does not decrypt: it is an unknown ticket, with
+  a wrong binder as well. Once the cache evicts an entry, tickets issued
+  no later than a minute after that entry's acceptance (the age check
+  admits tickets up to a minute in the future, so a clock stepped back
+  is covered) are not resumed; they are still REALITY's, so a wrong binder
+  on one gets the measured refusal as before. Before this, the restarted
+  process resumed the copy (`[43 51 41]`) for the target's ticket
+  lifetime, 604,800 s for a Go target. The cost is a full handshake for
+  each ticket a client holds after a restart (up to two), no resumption
+  across replicas, and, on a server that resumes 40,000 times within a
+  ticket lifetime, a shorter effective lifetime.
+  Covered by `TestReplayedResumedHelloReachesTheTarget`,
+  `TestRestartedServerDoesNotResumeAReplayedHello`
+  (`transport/internet/reality/resumption_wire_test.go`,
+  `resumption_restart_test.go`), `TestTicketFromAnotherProcessIsUnknown`,
+  `TestTicketHelloCacheForgetsOlderTickets`,
+  `TestTicketForgottenBeforeTheCopyIsRecorded` and
+  `TestRealityResumeSkipsForgottenTickets`
+  (`third_party/reality/reality_ticket_replay_test.go`).
+  An observer on the server-to-destination path can see the probe
+  connections. The probes start when an inbound with browser mode opens
+  its listener, before any client connects, the bad-binder refusal
+  measurement included; outbound opt-in only decides how each connection
+  is answered. Per destination and server name, the baseline starts six
+  TLS probes across the three ALPN modes. Browser mode adds two to four
+  per viable ALPN, plus a confirmation when a refusal probe sees silence.
+  HTTP/2 startup measurement can add up to eleven connections with a
+  SETTINGS exchange and, for a named target, a request to `/`. Profiles
+  refresh once per hour when used, with one-minute retries for an empty H2
+  profile. Counts depend on the destination's TLS and ALPN support.
+  The comparisons and passive-observation limits are documented in
+  `testing/realitystand/README.md`.
+  A ClientHello that offers a ticket this process issued with a wrong
+  binder is never authenticated: a sealed ticket, or an id of a session
+  this process keeps. A ticket older than seven days, the longest lifetime
+  TLS 1.3 allows, is not checked, and the target would not resume it
+  either. When the target's profile places the ticket and its refusal was
+  measured in the last three hours, REALITY refuses it as the target
+  refuses its own; otherwise it goes to the target, which answers its full
+  handshake. The profile does not place it while it is probed or unknown
+  for the hello's server name and ALPN, once a new probe found that the
+  target no longer resumes or has a new prefix, or once the ticket is
+  older than the lifetime the profile announces; then, for an
+  authenticated hello, an id is looked up whole, and a sealed ticket is
+  found by trying each prefix length up to 64 bytes with this process's
+  ticket key. Behind a longer prefix REALITY issues ids of sessions kept
+  in memory instead. Binders that do not match the identities go to the
+  target too: the session id does not cover them, so they can be split
+  anew in the same bytes. A ticket from before a restart does not decrypt
+  in the new process, so a censor who replays a recorded hello with a
+  spoiled binder after a restart sees REALITY's full handshake, as for any
+  unknown ticket, where the process that issued the ticket refused it or
+  sent it to the target. Covered by
+  `TestSpoiledBinderReachesTheTargetWhileTheProfileIsProbed`
+  (`transport/internet/reality/resumption_wire_test.go`),
+  `TestTicketWithWrongBinderIsRefused` and
+  `TestKnownBadBinderReachesCoverWithoutRefusalProfile`
+  (`transport/internet/reality/resumption_test.go`), and
+  `TestUnprofiledTicketSession`,
+  `TestInspectTicketHelloOutsideTheProfile`,
+  `TestInspectTicketHelloMismatchedBinders` and
+  `TestSealedTicketPrefixBound`
+  (`third_party/reality/session_cache_test.go`).
 - Vision takes the TLS input buffers through `proxy.VisionBuffers`
   (`proxy/vision_buffers.go`), which checks the field types and caches their
   offsets per connection type and fails closed on any other layout; upstream
@@ -142,6 +301,17 @@ guard it.
   client's SETTINGS with and without the tag) and
   `testing/release/build_contract_test.go` (release builds pass the tag). No
   test pins the redial pacing.
+- The XHTTP client bounds its TLS and REALITY handshake to 10 s
+  (`handshakeTimeout` in `transport/internet/splithttp/dialer.go`), over
+  HTTP/1.1 and HTTP/2; HTTP/3 keeps quic-go's own timeouts. Upstream closed
+  XTLS/Xray-core#7379 unmerged, and its dialer passes the dial's context,
+  which has no deadline, so a handshake blackholed after ClientHello held
+  every request queued behind that dial for good. The crypto/tls branch
+  (`fingerprint: "unsafe"`) now runs its handshake in the dial as the uTLS
+  and REALITY branches do, instead of on the first write. A timeout reaches
+  the log as `XHTTP: TLS handshake did not finish in 10s`. Keep the bound
+  when an upstream sync rewrites `dialContext`. Covered by
+  `Test_DialBlackholedHandshake` (one case per branch).
 - XHTTP inbounds accept Mux.Cool TCP sessions; upstream (XTLS/Xray-core#4128)
   limits them to pure XUDP. In packet-up and stream-up the server can poke an
   idle downlink with a Mux.Cool KeepAlive (`xhttpSettings.muxKeepAliveSecs`
@@ -153,6 +323,18 @@ guard it.
   client built against the old numbers must be regenerated (JSON configs are
   unaffected). Covered by `common/mux/server_test.go` and
   `common/singmux/xhttp_muxcool_integration_test.go`.
+- The TCP worker serves an accepted connection inline
+  (`tcpWorker.handleConnection`, `aa7aaf17`); upstream starts a goroutine per
+  connection. The XHTTP GET handler runs `addConn` itself, so the call returns
+  only when the session is over, and its `select` on the request context
+  after the call cannot see the GET end. The handler closes the session's
+  connection when the request context ends (`context.AfterFunc` before
+  `addConn`); upstream needs no such hook. Without it a packet-up session
+  whose client went away kept its upload queue read blocked, and a Mux.Cool
+  session that held an XUDP flow never went idle, so the handler and the
+  session's goroutines stayed until the process exited. The blocked read is
+  covered by `TestSplitHTTPGetClosesConnWhenRequestContextEnds`; no test runs
+  a Mux.Cool session with an XUDP flow through the hook.
 - Outbound `mux.maxReuseTimes` sets how many sessions one Mux.Cool
   connection of the main pool admits over its lifetime before new sessions
   open another connection. The main pool also carries UDP when
@@ -273,6 +455,16 @@ guard it.
   plain reader. Covered by `TestHTTPOutboundServerFirst`
   (`testing/scenarios/http_test.go`) and
   `proxy/vless/outbound/first_payload_test.go`.
+- The dispatcher stops sniffing a flow when a sniffer asks for more data
+  (`protocol.ErrProtoNeedMoreData`) while the cache already holds bytes past
+  the 32 KiB it shows a sniffer: further reads cannot change its answer.
+  Upstream reads on for the whole 200 ms sniffing budget, and since each read
+  drains the link, it caches everything the client uploads meanwhile, past
+  the pipe's limit: from a crafted TLS ClientHello, about a gigabyte of
+  cache per connection in-process, and hundreds of megabytes of peak memory
+  on a loopback server with 16 such connections. The flow is routed as after
+  a sniffing timeout, without waiting it out. Covered by
+  `app/dispatcher/sniff_cache_bound_test.go`.
 - The dispatcher routes through `Router.PickRouteTag`, the fork's
   allocation-free picker, not `PickRoute`. A routing `script` (upstream
   XTLS/Xray-core#6823) decides in both, and `NeedsSniffingAttributes` reports
@@ -521,6 +713,98 @@ guard it.
   the inbound copying a server worker's responses waited for their own
   timeouts. Covered by `TestWorkerEndInterruptsWrappedWriter`
   (`common/mux/mutex_writer_test.go`).
+- A Mux.Cool client worker made by `DialingWorkerFactory` ends its sessions
+  when its carrier returns, and delivers first what the carrier had written.
+  The factory closes the carrier's end of the downlink and interrupts the
+  uplink. The worker's reader then reads the downlink to its end and
+  finishes the worker; if it is held on a write to a session whose
+  application does not read, the factory takes the downlink over
+  (`common/mux/client_downlink.go`): nothing more will arrive and what is
+  left is bounded, so it is sorted by session, each session with something
+  left gets it from a goroutine of its own, after the write that was under
+  way if that was its own, and is closed after it, and every other session
+  is closed at once. No session waits for another's application to read;
+  closing a session interrupts its input and closes its output, and one
+  that waits for its peer still holds the closes after it, or the takeover
+  while a live END or a failed write closes it, as `main`'s cleanup does.
+  Pipes and the connection writers of the inbounds that hand theirs over
+  do not wait; an SMUX inbound's stream can, until its own carrier takes
+  its CLOSE or HALF_CLOSE frame, with no bound on the whole close. The
+  taken worker keeps no session, frame or unread bytes, interrupts the
+  downlink, and is not idle while a session is still handed its reply. With a
+  live carrier the downlink's order stands, Mux.Cool having no flow control
+  of its own, and the reader gives the downlink up only for the time of a
+  write or a log line, one lock per write; a write that meets the end of
+  its output stops that frame and leaves the session open, as `buf.Copy`
+  did. The end of an upload ends its session as it
+  does under a live carrier, Mux.Cool having no half-close, and so does an
+  upload that fails to be read, and one the uplink refuses while the
+  worker is open. An upload the uplink refuses on a closed worker does not:
+  the application ended nothing, and its reply may still be on its way.
+  Such an upload is read on and dropped for as long as its session lasts,
+  since left unread it would hold an application that sends before it
+  reads and hide one that goes away. The factory reports the carrier's
+  error only after all of the above, so that a slow log handler does not
+  hold up the end of the sessions; for the same reason a session reports
+  what stopped its upload after it has dropped the rest of that upload and
+  been closed or kept. Upstream closes the sessions and
+  interrupts the link in `monitor` as soon as the carrier returns, which
+  drops a response already received. The fork moved that cleanup out of
+  `monitor` in `4f01e31b`, after which a failed carrier left its sessions
+  open and silent. When syncing `common/mux/client.go`, do not take
+  upstream's `monitor` cleanup in place of this. Covered by
+  `TestDialingWorkerEndsSessionsWhenCarrierFails`,
+  `TestDialingWorkerDeliversWhatItsCarrierWroteBeforeEnding`
+  (`common/mux/client_carrier_failure_test.go`),
+  `TestDialingWorkerDrainsPastAFullUplinkWhenCarrierFails`
+  (`common/mux/client_carrier_uplink_test.go`),
+  `TestDialingWorkerEndsSiblingsOfASessionThatDoesNotRead`,
+  `TestClientWorkerKeepsTheDownlinkInOrderWhileItsCarrierLives`,
+  `TestDialingWorkerDeliversTheRestOfAFrameItWasWriting`,
+  `TestDialingWorkerSortsWhatItsCarrierLeft`,
+  `TestDialingWorkerSortsTheFramesItHandsNothingOutOf`,
+  `TestDialingWorkerKeepsDatagramsApartBehindASessionThatDoesNotRead`,
+  `TestDialingWorkerEndsAWaitingSessionWhenItsWriteFailsOrTheWorkerCloses`,
+  `TestDialingWorkerDropsWhatFollowsAWriteThatFailed`,
+  `TestClientWorkerClosesASessionWhoseOutputFailsAndGoesOn`,
+  `TestDialingWorkerIsNotIdleWhileASessionWaitsForItsReply`,
+  `TestDialingWorkerHandsTheDownlinkOutWhileAFailedWriteIsReported`,
+  `TestClientWorkerLeavesASessionWhoseOutputEnded`,
+  `TestClientWorkerFinishesBeforeItReportsWhatEndedItsReader`,
+  `TestDialingWorkerReportsAFailedWriteAtItsFramesEnd`,
+  `TestDialingWorkerHandsTheDownlinkOutBeforeItReportsItsCarrier`,
+  `TestDialingWorkerHandsOutTheRestBeforeItClosesTheOthers` and
+  `TestDialingWorkerLeavesTheDownlinkAloneAfterItWasTaken`
+  (`common/mux/client_carrier_siblings_test.go`),
+  `TestSessionRegistryClosedAroundAKeptSessionAdmitsNothing`
+  (`common/mux/registry_test.go`),
+  `TestTakeoverReleasesTheDownlinkAndKeepsALateReaderOut`,
+  `TestTakeoverLeavesAReaderThatStoppedAlone`,
+  `TestClientWorkerReleasesWhatItsReaderHeldWhenItEnds` and
+  `TestTailReportsAFailedWriteAfterItsSessionCloses`
+  (`common/mux/client_downlink_test.go`),
+  `TestDialingWorkerKeepsQueuedReplyWhenUploadIsRefusedAfterCarrierFails`,
+  `TestDialingWorkerEndsAnAbandonedSessionWhileItsReplyWaits`,
+  `TestDialingWorkerEndsASessionWithItsUploadWhileCarrierLives`,
+  `TestDialingWorkerEndsASessionWhoseInputFailsOnce`,
+  `TestDialingWorkerStopsReadingAnInputOnceItsSessionEnded`,
+  `TestDialingWorkerDropsARefusedUploadBeforeItReportsIt`,
+  `TestDialingWorkerReleasesTheUploadItDrops`,
+  `TestDialingWorkerEndsASessionRefusedWhileOpenThoughItsCarrierReturnsMeanwhile`,
+  `TestDialingWorkerKeepsQueuedReplyWhenTheRefusedBatchIsTheLast`,
+  `TestClientWorkerSendsTheLastBatchAndMarksAFailedUpload`
+  and `TestDialingWorkerClosesBeforeItReportsItsCarrier`
+  (`common/mux/client_carrier_upload_test.go`),
+  `TestDialingWorkerKeepsQueuedReplyWhenFirstUploadIsCutShort`,
+  `TestDialingWorkerEndsASessionWhoseOpeningFrameIsRefused`,
+  `TestDialingWorkerEndsAnUnansweredSessionWhenCarrierFails`,
+  `TestDialingWorkerEndsASessionWhoseRefusalReturnsAfterItsCarrier` and
+  `TestClientWorkerEndsASessionWhoseUploadIsRefusedWhileOpen`
+  (`common/mux/client_carrier_first_batch_test.go`),
+  `TestDialingWorkerEndsASessionWhoseFirstPayloadIsRefusedWhileOpen`,
+  `TestDialingWorkerDropsTheRestOfACutFirstPayload` and
+  `TestClientWorkerMarksTheEndAfterAFailedFirstRead`
+  (`common/mux/client_carrier_first_payload_test.go`).
 - The maintained SMUX implementation is the in-tree stack under
   `common/singmux`. Mux-related production code must not directly import
   SagerNet, MetaCubeX, Hashicorp, or another mux implementation.

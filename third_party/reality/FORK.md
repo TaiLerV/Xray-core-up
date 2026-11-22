@@ -21,6 +21,29 @@ Keep this list complete; everything else must match upstream byte for byte.
   without an X25519MLKEM768 key share is rejected, as upstream does. Xray's
   `realitySettings.requireMlkem` sets it; it is off by default. Covered by the
   same test.
+- `ticket_detect.go`, `reality_ticket.go`, and their integration with
+  `common.go`, `conn.go`, `handshake_server_tls13.go`, `record_detect.go`
+  and `tls.go` implement opt-in REALITY session tickets and destination
+  profiling. `h2_detect.go` measures the destination's HTTP/2 greeting for
+  XHTTP; `input_pending*.go` tell whether the client's data already waits
+  when the greeting starts (the kernel's count on Linux, read through a
+  FinalMask wrapper only when its `Splice()` is true), which picks the
+  grouping for a full Chromium handshake. The extension is disabled by default. The module tests cover
+  the ticket cache, process-local replay guard (tickets are keyed to the
+  process, and those issued before an evicted guard entry's acceptance
+  plus a minute are not resumed),
+  and both probe paths,
+  including ticket refusals with TCP FIN and RST. The module uses `x/net/http2/hpack`
+  for the H2 probe, with the related `x/crypto` and `x/sys` versions
+  recorded in `go.mod`.
+
+- `Server` (`tls.go`), the fallback copy from the target to the client: when
+  the copy ends with an error, such as a reset from the target, the client
+  connection is closed instead of half-closed. A client that stayed silent
+  otherwise held `Server` and its goroutines until its own socket timed out.
+  This is upstream's `8530a57` ("Try pass RST"), which upstream's main does
+  not carry; drop this entry once an update brings it. Covered by
+  `transport/internet/reality/fallback_close_test.go`.
 
 ## Updating
 
