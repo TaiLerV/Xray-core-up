@@ -190,7 +190,6 @@ func runHysteriaUDPLoad(t *testing.T, topology *stressTopology, targets []*net.U
 	for range hysteriaUDPLoadWindow {
 		tokens <- struct{}{}
 	}
-	seen := make([]bool, packets)
 	var sent, received atomic.Int64
 	var receiveErr error
 	var lastReceive atomic.Int64
@@ -203,30 +202,7 @@ func runHysteriaUDPLoad(t *testing.T, topology *stressTopology, targets []*net.U
 	}()
 	go func() {
 		defer close(receiverDone)
-		buffer := make([]byte, 2048)
-		relay := association.relay.AddrPort()
-		for received.Load() < int64(packets) {
-			if err := association.udp.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-				receiveErr = err
-				return
-			}
-			n, peer, err := association.udp.ReadFromUDPAddrPort(buffer)
-			if err != nil {
-				if !errors.Is(err, os.ErrDeadlineExceeded) {
-					receiveErr = err
-				}
-				return
-			}
-			if peer.Port() != relay.Port() || peer.Addr().Unmap() != relay.Addr().Unmap() || !recordHysteriaReply(buffer[:n], targets, seen, int(sent.Load())) {
-				continue
-			}
-			received.Add(1)
-			lastReceive.Store(time.Now().UnixNano())
-			select {
-			case tokens <- struct{}{}:
-			default:
-			}
-		}
+		receiveErr = receiveHysteriaReplies(association.udp, association.relay.AddrPort(), targets, packets, &sent, &received, &lastReceive, tokens)
 	}()
 
 	cpuBefore := processCPUTime(t, topology.server.command.Process.Pid)
@@ -289,6 +265,39 @@ func runHysteriaUDPLoad(t *testing.T, topology *stressTopology, targets []*net.U
 		t.Fatalf("server CPU clock failed to advance: %v to %v", cpuBefore, cpuAfter)
 	}
 	return result
+}
+
+// hysteriaUDPReplyReader is the subset of *net.UDPConn that receiveHysteriaReplies reads.
+type hysteriaUDPReplyReader interface {
+	SetReadDeadline(time.Time) error
+	ReadFromUDPAddrPort([]byte) (int, netip.AddrPort, error)
+}
+
+func receiveHysteriaReplies(reader hysteriaUDPReplyReader, relay netip.AddrPort, targets []*net.UDPAddr, packets int, sent, received, lastReceive *atomic.Int64, tokens chan<- struct{}) error {
+	buffer := make([]byte, 2048)
+	seen := make([]bool, packets)
+	for received.Load() < int64(packets) {
+		if err := reader.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			return err
+		}
+		n, peer, err := reader.ReadFromUDPAddrPort(buffer)
+		if err != nil {
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				return err
+			}
+			return nil
+		}
+		if peer.Port() != relay.Port() || peer.Addr().Unmap() != relay.Addr().Unmap() || !recordHysteriaReply(buffer[:n], targets, seen, int(sent.Load())) {
+			continue
+		}
+		received.Add(1)
+		lastReceive.Store(time.Now().UnixNano())
+		select {
+		case tokens <- struct{}{}:
+		default:
+		}
+	}
+	return nil
 }
 
 // recordHysteriaReply accepts one complete echo for each packet sent.
@@ -404,5 +413,45 @@ func TestHysteriaCPUPerPacketRequiresMeasurement(t *testing.T) {
 		if (err == nil) != (cpu > 0) || cpu > 0 && value != 0.5 {
 			t.Errorf("CPU %v: got %v ns/packet, %v", cpu, value, err)
 		}
+	}
+}
+
+type stubHysteriaUDPReplyReader struct {
+	deadlineErr error
+	readErr     error
+}
+
+func (s *stubHysteriaUDPReplyReader) SetReadDeadline(time.Time) error {
+	return s.deadlineErr
+}
+
+func (s *stubHysteriaUDPReplyReader) ReadFromUDPAddrPort([]byte) (int, netip.AddrPort, error) {
+	return 0, netip.AddrPort{}, s.readErr
+}
+
+func TestHysteriaLoadReportsReceiveError(t *testing.T) {
+	relay := netip.MustParseAddrPort("127.0.0.1:1080")
+	targets := []*net.UDPAddr{{IP: net.IPv4(127, 0, 0, 1), Port: 53}}
+	readFailure := errors.New("socket read failed")
+	deadlineFailure := errors.New("set deadline failed")
+
+	for _, tc := range []struct {
+		name    string
+		reader  *stubHysteriaUDPReplyReader
+		wantErr error
+	}{
+		{"read error", &stubHysteriaUDPReplyReader{readErr: readFailure}, readFailure},
+		{"deadline error", &stubHysteriaUDPReplyReader{deadlineErr: deadlineFailure}, deadlineFailure},
+		{"idle timeout", &stubHysteriaUDPReplyReader{readErr: os.ErrDeadlineExceeded}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sent, received, lastReceive atomic.Int64
+			sent.Store(1)
+			tokens := make(chan struct{}, 1)
+			err := receiveHysteriaReplies(tc.reader, relay, targets, 1, &sent, &received, &lastReceive, tokens)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("receiveHysteriaReplies() = %v, want %v", err, tc.wantErr)
+			}
+		})
 	}
 }
