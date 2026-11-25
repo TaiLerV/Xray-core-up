@@ -1176,3 +1176,43 @@ func TestHeaderMaskReadsIntoSmallBuffers(t *testing.T) {
 		}
 	}
 }
+
+type preservingPassThroughMask struct{}
+
+func (preservingPassThroughMask) PreserveServerPacketReads() {}
+func (preservingPassThroughMask) UDP()                       {}
+func (preservingPassThroughMask) WrapPacketConnClient(raw net.PacketConn, _ *net.Destination, _ *finalmask.Dialer) (net.PacketConn, error) {
+	return raw, nil
+}
+
+func (preservingPassThroughMask) WrapPacketConnServer(raw net.PacketConn, _ net.Addr, _ *finalmask.ListenConfig) (net.PacketConn, error) {
+	return raw, nil
+}
+
+func TestRawHeaderMaskAbovePreservingMaskDropsOversizedDatagram(t *testing.T) {
+	socket := newScriptedPacketConn()
+	for _, payload := range []string{"long", "ok"} {
+		packet := append([]byte{4, 0, 0, 0}, payload...)
+		socket.reads <- recordedPacketWrite{payload: packet, addr: socket.local}
+	}
+	if err := socket.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// NewFinalMask reverses udpMasks, so placing header before the preserving
+	// mask puts the header manager above the preserving mask on the server.
+	stack := finalmask.NewFinalMask(nil, []finalmask.UDPMask{&header.Config{ID: int32(header.WIREGUARD)}, preservingPassThroughMask{}}, nil, nil,
+		nil,
+		func(context.Context, net.Addr) (net.PacketConn, error) { return socket, nil })
+	conn, err := stack.ListenRawPacket(t.Context(), socket.local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p [2]byte
+	n, _, err := conn.ReadFrom(p[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(p[:n]) != "ok" {
+		t.Fatalf("read %q, want %q", p[:n], "ok")
+	}
+}

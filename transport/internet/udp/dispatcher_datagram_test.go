@@ -190,3 +190,44 @@ func TestDispatcherHonorsReplacedDomainDestination(t *testing.T) {
 		t.Fatalf("read %q from %v, %v", p[:n], addr, err)
 	}
 }
+
+func TestDispatcherConnHandlesDomainSourceWithoutPanic(t *testing.T) {
+	conn, uplinkReader, writer := dialDispatcherLink(t)
+	if _, err := conn.WriteTo([]byte("open"), &gonet.UDPAddr{IP: gonet.IPv4(127, 0, 0, 1), Port: 53}); err != nil {
+		t.Fatal(err)
+	}
+	openBatch, err := uplinkReader.ReadMultiBufferTimeout(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf.ReleaseMulti(openBatch)
+
+	b := buf.New()
+	b.SetManagedUDPDomain("reply.example", 5300)
+	b.WriteString("pong")
+	if err := writer.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
+		t.Fatal(err)
+	}
+	var p [4]byte
+	n, addr, err := conn.ReadFrom(p[:])
+	if err != nil || string(p[:n]) != "pong" {
+		t.Fatalf("read %q from %v, %v", p[:n], addr, err)
+	}
+	if addr == nil || addr.Network() != "udp" || addr.String() != "reply.example:5300" {
+		t.Fatalf("reply source = %v (%T), want udp reply.example:5300", addr, addr)
+	}
+	if b.Cap() != 0 {
+		t.Fatal("domain reply still owns its buffer after ReadFrom")
+	}
+	if n, err := conn.WriteTo([]byte("echo"), addr); err != nil || n != 4 {
+		t.Fatalf("WriteTo(domain source) = (%d, %v), want (4, nil)", n, err)
+	}
+	echoBatch, err := uplinkReader.ReadMultiBufferTimeout(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buf.ReleaseMulti(echoBatch)
+	if len(echoBatch) != 1 || string(echoBatch[0].Bytes()) != "echo" || echoBatch[0].UDP == nil || echoBatch[0].UDP.NetAddr() != "reply.example:5300" {
+		t.Fatalf("dispatched echo = %v, want echo to reply.example:5300", echoBatch)
+	}
+}

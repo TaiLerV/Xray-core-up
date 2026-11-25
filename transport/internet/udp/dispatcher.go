@@ -219,6 +219,13 @@ func (c *dispatcherConn) callback(ctx context.Context, packet *udp.Packet) {
 	}
 }
 
+type domainUDPAddr struct {
+	dest net.Destination
+}
+
+func (domainUDPAddr) Network() string  { return "udp" }
+func (a domainUDPAddr) String() string { return a.dest.NetAddr() }
+
 // ReadFrom reads a reply that p holds. It drops one longer than p and reads
 // the next, where a copy of its start would pass for a whole reply.
 func (c *dispatcherConn) ReadFrom(p []byte) (int, net.Addr, error) {
@@ -241,9 +248,16 @@ func (c *dispatcherConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			continue
 		}
 		n := copy(p, packet.Payload.Bytes())
-		source := &net.UDPAddr{
-			IP:   packet.Source.Address.IP(),
-			Port: int(packet.Source.Port),
+		var source net.Addr
+		if packet.Source.Address != nil {
+			if packet.Source.Address.Family().IsIP() {
+				source = &net.UDPAddr{
+					IP:   packet.Source.Address.IP(),
+					Port: int(packet.Source.Port),
+				}
+			} else if packet.Source.Address.Family().IsDomain() {
+				source = domainUDPAddr{dest: packet.Source}
+			}
 		}
 		packet.Payload.Release()
 		return n, source, nil
@@ -261,7 +275,12 @@ func (c *dispatcherConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	}
 	copy(buffer.Extend(int32(len(p))), p)
 
-	destination := net.DestinationFromAddr(addr)
+	var destination net.Destination
+	if domainAddr, ok := addr.(domainUDPAddr); ok {
+		destination = domainAddr.dest
+	} else {
+		destination = net.DestinationFromAddr(addr)
+	}
 	buffer.UDP = &destination
 	if err := c.dispatcher.dispatch(c.ctx, destination, buffer); err != nil {
 		return 0, err

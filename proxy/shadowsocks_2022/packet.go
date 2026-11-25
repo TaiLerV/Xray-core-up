@@ -1,6 +1,7 @@
 package shadowsocks_2022
 
 import (
+	"context"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
@@ -709,6 +710,7 @@ type UDPWriter struct {
 	Writer      io.Writer
 	Destination net.Destination
 	Session     *ClientUDPSession
+	drops       net.DropLog
 }
 
 func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -734,8 +736,15 @@ func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			buf.ReleaseMulti(mb)
 			return err
 		}
+		pktLen := pktBuf.Len()
 		_, writeErr := w.Writer.Write(pktBuf.Bytes())
 		pktBuf.Release()
+		if net.IsMessageTooLong(writeErr) {
+			if w.drops.Due() {
+				errors.LogDebug(context.Background(), "dropped a UDP datagram of ", pktLen, " bytes that the socket refuses as too long")
+			}
+			continue
+		}
 		if writeErr != nil {
 			buf.ReleaseMulti(mb)
 			return writeErr
@@ -747,6 +756,7 @@ func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 type UDPReader struct {
 	Reader  io.Reader
 	Session *ClientUDPSession
+	drops   net.DropLog
 }
 
 func (r *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
@@ -755,6 +765,12 @@ func (r *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		_, err := buffer.ReadFrom(r.Reader)
 		if err != nil {
 			buffer.Release()
+			if net.IsMessageTooLong(err) {
+				if r.drops.Due() {
+					errors.LogDebug(context.Background(), "dropped a UDP reply that the socket reports as too long")
+				}
+				continue
+			}
 			return nil, err
 		}
 

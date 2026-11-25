@@ -86,4 +86,46 @@ func TestRawListenerPreservesXDNSServerPacketReads(t *testing.T) {
 	if want, got := exchange(plain.LocalAddr()), exchange(hub.Addr()); !bytes.Equal(want, got) {
 		t.Fatalf("hub reply %x differs from plain listener reply %x", got, want)
 	}
+
+	probe := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 0x4242, RecursionDesired: true},
+		Questions: []dnsmessage.Question{{Name: dnsmessage.MustNewName("www.example.org."), Type: dnsmessage.TypeTXT, Class: dnsmessage.ClassINET}},
+	}
+	probeWire, err := probe.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	exchangeProbe := func(addr net.Addr, payload []byte) []byte {
+		t.Helper()
+		client, err := net.DialUDP("udp4", nil, addr.(*net.UDPAddr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		if err := client.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		var packet [4096]byte
+		n, err := client.Read(packet[:])
+		if err != nil {
+			t.Fatalf("size %d: no reply: %v", len(payload), err)
+		}
+		var reply dnsmessage.Message
+		if err := reply.Unpack(packet[:n]); err != nil {
+			t.Fatalf("size %d: unpack reply: %v", len(payload), err)
+		}
+		if !reply.Response || reply.ID != probe.ID || reply.RCode != dnsmessage.RCodeNameError {
+			t.Fatalf("size %d: unexpected reply header: %+v", len(payload), reply.Header)
+		}
+		return packet[:n]
+	}
+	for _, size := range []int{512, 513, 600, 1232} {
+		padded := append(bytes.Clone(probeWire), make([]byte, size-len(probeWire))...)
+		if want, got := exchangeProbe(plain.LocalAddr(), padded), exchangeProbe(hub.Addr(), padded); !bytes.Equal(want, got) {
+			t.Fatalf("size %d: hub reply %x differs from plain listener reply %x", size, got, want)
+		}
+	}
 }

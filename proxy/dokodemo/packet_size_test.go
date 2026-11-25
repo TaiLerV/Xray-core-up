@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	stdnet "net"
+	"sync"
 	"testing"
 	"time"
 
@@ -134,5 +135,89 @@ func TestPacketWriterDropsRepliesTheSocketRefusesAsTooLong(t *testing.T) {
 				t.Fatalf("the writer closed the socket that refused a reply: %v", err)
 			}
 		})
+	}
+}
+
+type addressOnly struct{ net.Address }
+
+type recordingPacketConn struct {
+	mu     sync.Mutex
+	writes int
+	closed bool
+}
+
+func (c *recordingPacketConn) ReadFrom([]byte) (int, stdnet.Addr, error) { select {} }
+func (c *recordingPacketConn) WriteTo(p []byte, _ stdnet.Addr) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writes++
+	return len(p), nil
+}
+
+func (c *recordingPacketConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	return nil
+}
+
+func (*recordingPacketConn) LocalAddr() stdnet.Addr          { return &stdnet.UDPAddr{} }
+func (*recordingPacketConn) SetDeadline(time.Time) error     { return nil }
+func (*recordingPacketConn) SetReadDeadline(time.Time) error { return nil }
+func (*recordingPacketConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+// PacketWriter must key source sockets by IP value, not by a pointer into a
+// released packet buffer slab.
+func TestPacketWriterReusesTargetSocketForSlabAddresses(t *testing.T) {
+	ipv4 := [4]byte{192, 0, 2, 1}
+	for _, test := range []struct {
+		name   string
+		target net.Destination
+		set    func(*buf.Buffer)
+	}{
+		{name: "managed ipv4", target: net.UDPDestination(net.IPv4Address(ipv4), 443), set: func(b *buf.Buffer) { b.SetManagedUDPIPv4(ipv4, 443) }},
+		{name: "IP without NetIPAddr", target: net.UDPDestination(net.IPv4Address(ipv4), 443), set: func(b *buf.Buffer) {
+			b.SetManagedUDPDestination(net.UDPDestination(addressOnly{net.IPv4Address(ipv4)}, 443))
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			target := &recordingPacketConn{}
+			writer := NewPacketWriter(target, &test.target, 0, &stdnet.UDPAddr{IP: stdnet.IPv4(127, 0, 0, 1), Port: 9}).(*PacketWriter)
+			fallback := &recordingPacketConn{}
+			writer.conn = fallback
+			mb := make(buf.MultiBuffer, 0, 3)
+			for range 3 {
+				reply := buf.New()
+				reply.WriteString("reply")
+				test.set(reply)
+				mb = append(mb, reply)
+			}
+			if err := writer.WriteMultiBuffer(mb); err != nil {
+				t.Fatal(err)
+			}
+			if target.writes != 3 || fallback.writes != 0 || len(writer.conns) != 1 {
+				t.Fatalf("target socket got %d of 3 replies, fallback %d; writer holds %d sockets, want 1", target.writes, fallback.writes, len(writer.conns))
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !target.closed {
+				t.Fatal("Close left the target socket open")
+			}
+		})
+	}
+}
+
+func TestPacketWriterClosesUnkeyedSocket(t *testing.T) {
+	target := &recordingPacketConn{}
+	destination := net.UDPDestination(net.DomainAddress("example.com"), 443)
+	writer := NewPacketWriter(target, &destination, 0, &stdnet.UDPAddr{IP: stdnet.IPv4(127, 0, 0, 1), Port: 9}).(*PacketWriter)
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !target.closed {
+		t.Fatal("Close left the socket of a non-IP destination open")
 	}
 }

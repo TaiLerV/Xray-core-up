@@ -414,10 +414,13 @@ guard it.
   connected socket skips that error. The other writers to a UDP socket that a
   whole datagram now reaches drop one their socket refuses as too long and go
   on with the session, where upstream's would end it: those of the
-  Shadowsocks, SOCKS, WireGuard and MASQUE outbounds, the last two of which
-  also drop one longer than an IP packet holds before the write, of
-  dokodemo-door in both modes (`buf.DatagramWriter` and its TPROXY writer), of
-  the DNS outbound's queries, and the Shadowsocks 2022 server's reply loop.
+  Shadowsocks, Shadowsocks 2022, SOCKS, WireGuard and MASQUE outbounds, the
+  last two of which also drop one longer than an IP packet holds before the
+  write, of dokodemo-door in both modes (`buf.DatagramWriter` and its TPROXY
+  writer, whose source-socket cache is keyed by address value), of the DNS
+  outbound's queries, and the Shadowsocks 2022 server's reply loop. The
+  Shadowsocks 2022 UDP reader also skips a socket `EMSGSIZE` read error and
+  continues the session.
   SOCKS encodes a datagram that a regular buffer does not hold with its header
   in a buffer of its size, inbound and outbound, where upstream sends an empty
   datagram in its place: from 8183 bytes for an IPv4 address. The TUN,
@@ -427,7 +430,8 @@ guard it.
   one above 65527 bytes. Hysteria's UDP writer drops a datagram that
   does not fit its 8192-byte buffer with the header, as upstream's does.
   Each drop on a UDP socket or a TUN is logged at debug level by the component
-  that drops it, the first of each session or socket at once and then one a
+  that drops it (including the SOCKS and legacy Shadowsocks UDP inbound reply
+  writes), the first of each session or socket at once and then one a
   second (`net.DropLog`), and freedom logs it with the context of its session;
   a datagram that the Mux.Cool, Trojan, Shadowsocks 2022, VLESS, VMess or XUDP
   writer cannot frame never reaches a socket, and that drop is not logged.
@@ -454,7 +458,9 @@ guard it.
   `TestPacketReaderTakesMemoryAsThePacketArrives` (`common/xudp`),
   `TestCachedReaderLendsAFirstDatagramLongerThanThePayload` and
   `TestSniffJudgesAFirstDatagramLongerThanThePayload` (`app/dispatcher`),
-  `TestUDPWriterDropsDatagramsTooLargeForAPacket` and
+  `TestUDPWriterDropsDatagramsTooLargeForAPacket`,
+  `TestUDPWriterDropsDatagramsTheSocketRefusesAsTooLong`,
+  `TestUDPReaderSkipsSocketTooLongError` and
   `TestUDPReplyLoopDropsRepliesTheSocketRefusesAsTooLong`
   (`proxy/shadowsocks_2022`),
   `TestUDPWriterDropsDatagramsTheSocketRefusesAsTooLong` (`proxy/shadowsocks`),
@@ -465,8 +471,10 @@ guard it.
   `TestUDPConnClientDropsDatagramsTheSocketRefusesAsTooLong` and
   `TestUDPConnDropsRepliesTooLongForIP` (`proxy/wireguard`),
   `TestUDPConnDropsRepliesTooLongForIP` (`proxy/tun`),
-  `TestProcessDropsRepliesTheSocketRefusesAsTooLong` and
-  `TestPacketWriterDropsRepliesTheSocketRefusesAsTooLong` (`proxy/dokodemo`),
+  `TestProcessDropsRepliesTheSocketRefusesAsTooLong`,
+  `TestPacketWriterDropsRepliesTheSocketRefusesAsTooLong`,
+  `TestPacketWriterReusesTargetSocketForSlabAddresses` and
+  `TestPacketWriterClosesUnkeyedSocket` (`proxy/dokodemo`),
   `TestDNSOutboundDropsQueriesTheSocketRefusesAsTooLong` (`proxy/dns`),
   `TestMaxUDPPayload` and `TestDropLogLetsTheFirstDropThenOneASecond`
   (`common/net`), `TestPacketWriterDropsDatagramsTooLongForIP`,
@@ -511,9 +519,11 @@ guard it.
   An active sender can observe missing replies where a truncated prefix used
   to draw a response, on both a masked hub and a masked outbound. Passive
   observers may see different packet counts for that traffic. The xdns test
-  compares a valid zone-apex reply through the hub and the ordinary listener
-  and checks which socket the server reads. The Linux pass-through test checks
-  the original destination and physical peer.
+  compares a valid zone-apex reply and oversized out-of-zone probes (512, 513,
+  600 and 1232 bytes) through the hub and the ordinary listener and checks
+  which socket the server reads. Header masks layered above a mask that
+  preserves native server packet reads keep the raw decoded-size drop check.
+  The Linux pass-through test checks the original destination and physical peer.
   With `sockopt.dialerProxy` and no mask, freedom's connection is that link,
   which carries buffers and has a TCP address for UDP too. Upstream's freedom
   writes to it and reads it as a stream of bytes, so a datagram of 9000 bytes
@@ -542,15 +552,17 @@ guard it.
   `TestDatagramConnectionReadDropsDatagramsLongerThanTheBuffer`
   (`common/net/cnc`),
   `TestDatagramReaderDropsDatagramsLongerThanABuffer` (`common/buf`),
-  `TestRawListenerPreservesXDNSServerPacketReads` and
+  `TestRawListenerPreservesXDNSServerPacketReads`,
+  `TestRawHeaderMaskAbovePreservingMaskDropsOversizedDatagram` and
   `TestWholeDatagramConnDropsMessageTooLong` (`transport/internet/finalmask`),
   `TestPassthroughFilterPreservesHubPacketMetadata`,
   `TestHubDropsDatagramsLongerThanItsBuffer`,
   `TestMaskedHubDropsDatagramsLongerThanItsBuffer`,
   `TestHubServesOnAfterAReadOfATooLongDatagram`,
   `TestHubStopsServingOnOtherReadErrors`,
-  `TestDispatcherConnWritesDatagramsWhole` and
-  `TestDispatcherConnDropsRepliesLongerThanTheRead`
+  `TestDispatcherConnWritesDatagramsWhole`,
+  `TestDispatcherConnDropsRepliesLongerThanTheRead` and
+  `TestDispatcherConnHandlesDomainSourceWithoutPanic`
   (`transport/internet/udp`),
   `TestTempUDPConnDropsDatagramsLongerThanTheRead` and
   `TestUDPReaderDropsPacketsLongerThanARead` (`proxy/socks`),

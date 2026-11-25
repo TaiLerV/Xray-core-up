@@ -247,9 +247,10 @@ func (fm *FinalMask) listenPacketBelowMasks(ctx context.Context, addr net.Addr, 
 	if len(fm.udpMasks) == 0 {
 		return fm.listenPacket(ctx, addr)
 	}
+	lastPreserve := -1
 	for i := range fm.udpMasks {
 		if _, ok := fm.udpMasks[i].(interface{ PreserveServerPacketReads() }); ok {
-			whole = false
+			lastPreserve = i
 		}
 		if i > 0 {
 			if _, ok := fm.udpMasks[i].(interface{ HandleListen() }); ok {
@@ -264,7 +265,7 @@ func (fm *FinalMask) listenPacketBelowMasks(ctx context.Context, addr net.Addr, 
 		if err != nil {
 			return nil, err
 		}
-		if whole {
+		if whole && lastPreserve < 0 {
 			conn = dropCutDatagrams(conn)
 		}
 	}
@@ -286,7 +287,7 @@ func (fm *FinalMask) listenPacketBelowMasks(ctx context.Context, addr net.Addr, 
 			conns = append(conns, newConn)
 		} else {
 			if len(conns) > 0 {
-				conn = &headerManagerConn{PacketConn: conn, sizes: sizes, conns: conns, whole: whole}
+				conn = &headerManagerConn{PacketConn: conn, sizes: sizes, conns: conns, whole: whole && i-1 > lastPreserve}
 				sizes = nil
 				conns = nil
 			}
@@ -299,7 +300,7 @@ func (fm *FinalMask) listenPacketBelowMasks(ctx context.Context, addr net.Addr, 
 		}
 	}
 	if len(conns) > 0 {
-		conn = &headerManagerConn{PacketConn: conn, sizes: sizes, conns: conns, whole: whole}
+		conn = &headerManagerConn{PacketConn: conn, sizes: sizes, conns: conns, whole: whole && len(fm.udpMasks)-1 > lastPreserve}
 		sizes = nil
 		conns = nil
 	}

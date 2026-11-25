@@ -102,6 +102,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 }
 
 func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
+	var drops net.DropLog
 	udpServer := udp.NewDispatcher(dispatcher, func(ctx context.Context, packet *udp_proto.Packet) {
 		request := protocol.RequestHeaderFromContext(ctx)
 		payload := packet.Payload
@@ -125,7 +126,10 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 			return
 		}
 
-		conn.Write(data.Bytes())
+		_, err = conn.Write(data.Bytes())
+		if net.IsMessageTooLong(err) && drops.Due() {
+			errors.LogDebug(ctx, "dropped a UDP reply of ", data.Len(), " bytes that the socket refuses as too long")
+		}
 		data.Release()
 	})
 	defer udpServer.RemoveRay()
