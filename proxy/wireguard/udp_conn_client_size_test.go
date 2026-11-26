@@ -190,3 +190,64 @@ func TestUDPConnClientDropsRepliesLongerThanARead(t *testing.T) {
 		buf.ReleaseMulti(mb)
 	}
 }
+
+type packetConnReadStep struct {
+	fillScratch bool
+	payload     []byte
+	addr        net.Addr
+	err         error
+}
+
+type steppedReadPacketConn struct {
+	net.PacketConn
+	steps []packetConnReadStep
+}
+
+func (c *steppedReadPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	step := c.steps[0]
+	c.steps = c.steps[1:]
+	if step.fillScratch {
+		return len(p), step.addr, step.err
+	}
+	if len(step.payload) > 0 {
+		return copy(p, step.payload), step.addr, step.err
+	}
+	return 0, step.addr, step.err
+}
+
+// A kernel UDP socket on Windows reports an oversized reply with WSAEMSGSIZE
+// alongside len(scratch) or 0 bytes, and a socket reporting EMSGSIZE on read
+// must not end the tunnel's UDP session. UDPConnClient drops that reply and
+// reads the next; any other read error still ends the session.
+func TestUDPConnClientSkipsSocketTooLongReadError(t *testing.T) {
+	tooLong := &stdnet.OpError{Op: "read", Net: "udp", Err: os.NewSyscallError("recvfrom", syscall.EMSGSIZE)}
+	peer := &net.UDPAddr{IP: net.IP{192, 0, 2, 9}, Port: 5353}
+	conn := &steppedReadPacketConn{
+		steps: []packetConnReadStep{
+			{fillScratch: true, addr: peer, err: tooLong},
+			{addr: nil, err: tooLong},
+			{payload: []byte("pong"), addr: peer},
+			{err: stdnet.ErrClosed},
+		},
+	}
+	client := &UDPConnClient{PacketConn: conn, Dest: peer}
+
+	mb, err := client.ReadMultiBuffer()
+	if err != nil {
+		t.Fatalf("ReadMultiBuffer() = %v, want EMSGSIZE skipped and pong returned", err)
+	}
+	if len(mb) != 1 || !bytes.Equal(mb[0].Bytes(), []byte("pong")) {
+		buf.ReleaseMulti(mb)
+		t.Fatalf("read %d buffers (%d bytes), want pong", len(mb), mb.Len())
+	}
+	if mb[0].UDP == nil || mb[0].UDP.Port != 5353 {
+		buf.ReleaseMulti(mb)
+		t.Fatalf("the datagram comes from %v, want %v", mb[0].UDP, peer)
+	}
+	buf.ReleaseMulti(mb)
+
+	if mb, err := client.ReadMultiBuffer(); !errors.Is(err, stdnet.ErrClosed) {
+		buf.ReleaseMulti(mb)
+		t.Fatalf("ReadMultiBuffer() = %v, want %v", err, stdnet.ErrClosed)
+	}
+}

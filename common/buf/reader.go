@@ -31,8 +31,9 @@ func readOneUDP(r io.Reader) (*Buffer, error) {
 // like one, returns a datagram per Read and cuts one longer than the buffer it
 // reads into without a sign. Each read takes one byte more than a Buffer
 // holds, so that a datagram longer than Size shows: it is dropped, rather than
-// passed on cut as a datagram of its own, and the next is read. An empty
-// datagram is skipped, as PacketReader skips it.
+// passed on cut as a datagram of its own, and the next is read; a read that
+// the socket itself fails as too long is skipped likewise. An empty datagram
+// is skipped, as PacketReader skips it.
 type DatagramReader struct {
 	Reader  io.Reader
 	scratch [Size + 1]byte
@@ -44,7 +45,7 @@ func (r *DatagramReader) ReadMultiBuffer() (MultiBuffer, error) {
 	for empty := 0; empty < 64; {
 		n, err := r.Reader.Read(r.scratch[:])
 		switch {
-		case n > Size:
+		case n > Size || xnet.IsMessageTooLong(err):
 			if r.drops.Due() {
 				errors.LogDebug(context.Background(), "dropped a UDP datagram longer than the ", Size, " bytes a read takes")
 			}

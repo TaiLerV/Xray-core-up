@@ -404,18 +404,19 @@ type UDPConnClient struct {
 // ReadMultiBuffer returns the next reply of the tunnel. The stack and a
 // kernel socket cut a datagram longer than the buffer of a read without a
 // sign, so a read takes one byte more than a Buffer holds: a reply longer
-// than buf.Size is dropped, rather than passed on cut as a whole datagram.
+// than buf.Size, or one the socket reports as too long, is dropped rather
+// than passed on cut as a whole datagram or allowed to end the session.
 func (c *UDPConnClient) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	for {
 		n, addr, err := c.PacketConn.ReadFrom(c.scratch[:])
-		if err != nil {
-			return nil, err
-		}
-		if n > buf.Size {
+		if n > buf.Size || net.IsMessageTooLong(err) {
 			if c.drops.Due() {
 				errors.LogDebug(context.Background(), "dropped a UDP reply longer than the ", buf.Size, " bytes a read takes")
 			}
 			continue
+		}
+		if err != nil {
+			return nil, err
 		}
 		b := buf.New()
 		common.Must2(b.Write(c.scratch[:n]))

@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	stdnet "net"
+	"os"
+	"syscall"
 	"testing"
 
 	. "github.com/xtls/xray-core/common/buf"
@@ -53,5 +56,60 @@ func TestDatagramReaderDropsDatagramsLongerThanABuffer(t *testing.T) {
 	if mb, err := reader.ReadMultiBuffer(); !errors.Is(err, io.EOF) {
 		ReleaseMulti(mb)
 		t.Fatalf("after the datagrams: %v, want io.EOF", err)
+	}
+}
+
+type tooLongReadStep struct {
+	n       int
+	payload []byte
+	err     error
+}
+
+type steppedDatagramReader struct {
+	steps []tooLongReadStep
+}
+
+func (r *steppedDatagramReader) Read(p []byte) (int, error) {
+	if len(r.steps) == 0 {
+		return 0, io.EOF
+	}
+	step := r.steps[0]
+	r.steps = r.steps[1:]
+	if len(step.payload) > 0 {
+		return copy(p, step.payload), step.err
+	}
+	return step.n, step.err
+}
+
+// On Windows a synchronous WSARecv failure on an oversized datagram and on
+// Linux a connected UDP socket reporting a router's ICMP "fragmentation needed"
+// return EMSGSIZE/WSAEMSGSIZE with n == 0 (or with the filled scratch length).
+// DatagramReader skips that error and returns the next datagram; any other
+// error still ends the session.
+func TestDatagramReaderSkipsSocketTooLongError(t *testing.T) {
+	tooLong := &stdnet.OpError{Op: "read", Net: "udp", Err: os.NewSyscallError("recvfrom", syscall.EMSGSIZE)}
+	reader := &DatagramReader{
+		Reader: &steppedDatagramReader{
+			steps: []tooLongReadStep{
+				{n: 0, err: tooLong},
+				{n: Size + 1, err: tooLong},
+				{payload: []byte("pong")},
+				{n: 0, err: stdnet.ErrClosed},
+			},
+		},
+	}
+	mb, err := reader.ReadMultiBuffer()
+	if err != nil {
+		t.Fatalf("ReadMultiBuffer() = %v, want EMSGSIZE skipped and pong returned", err)
+	}
+	if len(mb) != 1 || !bytes.Equal(mb[0].Bytes(), []byte("pong")) {
+		ReleaseMulti(mb)
+		t.Fatalf("read %d buffers (%d bytes), want pong", len(mb), mb.Len())
+	}
+	ReleaseMulti(mb)
+
+	if mb, err := reader.ReadMultiBuffer(); !errors.Is(err, stdnet.ErrClosed) {
+		ReleaseMulti(mb)
+		t.Fatalf("ReadMultiBuffer() = %v, want %v", err, stdnet.ErrClosed)
 	}
 }

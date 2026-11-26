@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
@@ -322,9 +323,17 @@ func (s *ServerUDPSession) EnsureServerState(method *CipherMethod, psk []byte) e
 	return nil
 }
 
+func newPacketBuffer(size int) *buf.Buffer {
+	if size <= int(buf.Size) {
+		return buf.New()
+	}
+	return buf.NewWithSize(int32(size))
+}
+
 func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessionID uint64, dest net.Destination, payload []byte) ([]byte, error) {
 	serverSessionID := s.ServerSessionID
 	serverPacketID := s.ServerPacketID.Add(1) - 1
+	addrPortLen := AddrPortLength(dest)
 
 	if method.IsChaCha {
 		var nonce [PacketNonceSize]byte
@@ -332,22 +341,26 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 			return nil, err
 		}
 
-		plainBuf := buf.New()
+		var hdr [16 + 1 + 8 + 8 + 2]byte
+		plainLen := len(hdr) + addrPortLen + len(payload)
+		if plainLen > math.MaxInt32 {
+			return nil, ErrPacketTooLarge
+		}
+		plainBuf := newPacketBuffer(plainLen)
 		defer plainBuf.Release()
 
-		var hdr [16 + 1 + 8 + 8 + 2]byte
 		binary.BigEndian.PutUint64(hdr[0:8], serverSessionID)
 		binary.BigEndian.PutUint64(hdr[8:16], serverPacketID)
 		hdr[16] = HeaderTypeServer
 		binary.BigEndian.PutUint64(hdr[17:25], uint64(time.Now().Unix()))
 		binary.BigEndian.PutUint64(hdr[25:33], clientSessionID)
 		binary.BigEndian.PutUint16(hdr[33:35], 0)
-		plainBuf.Write(hdr[:])
+		common.Must2(plainBuf.Write(hdr[:]))
 
 		if err := WriteAddressPort(plainBuf, dest); err != nil {
 			return nil, err
 		}
-		plainBuf.Write(payload)
+		common.Must2(plainBuf.Write(payload))
 
 		sealed := s.serverChaCha.Seal(nil, nonce[:], plainBuf.Bytes(), nil)
 		res := make([]byte, PacketNonceSize+len(sealed))
@@ -364,20 +377,24 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 	var encryptedHeader [16]byte
 	s.serverHeaderBlock.Encrypt(encryptedHeader[:], rawHeader[:])
 
-	bodyBuf := buf.New()
+	var hdr [1 + 8 + 8 + 2]byte
+	bodyLen := len(hdr) + addrPortLen + len(payload)
+	if bodyLen > math.MaxInt32 {
+		return nil, ErrPacketTooLarge
+	}
+	bodyBuf := newPacketBuffer(bodyLen)
 	defer bodyBuf.Release()
 
-	var hdr [1 + 8 + 8 + 2]byte
 	hdr[0] = HeaderTypeServer
 	binary.BigEndian.PutUint64(hdr[1:9], uint64(time.Now().Unix()))
 	binary.BigEndian.PutUint64(hdr[9:17], clientSessionID)
 	binary.BigEndian.PutUint16(hdr[17:19], 0)
-	bodyBuf.Write(hdr[:])
+	common.Must2(bodyBuf.Write(hdr[:]))
 
 	if err := WriteAddressPort(bodyBuf, dest); err != nil {
 		return nil, err
 	}
-	bodyBuf.Write(payload)
+	common.Must2(bodyBuf.Write(payload))
 
 	bodyNonce := rawHeader[4:16]
 	sealedBody := s.serverBodyCipher.Seal(nil, bodyNonce, bodyBuf.Bytes(), nil)

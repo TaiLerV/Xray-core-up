@@ -419,8 +419,14 @@ guard it.
   write, of dokodemo-door in both modes (`buf.DatagramWriter` and its TPROXY
   writer, whose source-socket cache is keyed by address value), of the DNS
   outbound's queries, and the Shadowsocks 2022 server's reply loop. The
-  Shadowsocks 2022 UDP reader also skips a socket `EMSGSIZE` read error and
-  continues the session.
+  Shadowsocks 2022 server packet encoder sizes its plaintext buffer for a reply
+  above `buf.Size` instead of truncating the payload into a regular buffer
+  (from 8167 bytes with AES-GCM or 8151 bytes with ChaCha20-Poly1305 to an IPv4
+  address), so a client with a larger read buffer receives the whole reply
+  while an 8 KiB Xray client drops it without advancing its replay window and
+  the server's socket drops one longer than an IP packet holds. The Shadowsocks
+  2022 UDP reader also skips a socket `EMSGSIZE` read error and continues the
+  session.
   SOCKS encodes a datagram that a regular buffer does not hold with its header
   in a buffer of its size, inbound and outbound, where upstream sends an empty
   datagram in its place: from 8183 bytes for an IPv4 address. The TUN,
@@ -460,7 +466,8 @@ guard it.
   `TestSniffJudgesAFirstDatagramLongerThanThePayload` (`app/dispatcher`),
   `TestUDPWriterDropsDatagramsTooLargeForAPacket`,
   `TestUDPWriterDropsDatagramsTheSocketRefusesAsTooLong`,
-  `TestUDPReaderSkipsSocketTooLongError` and
+  `TestUDPReaderSkipsSocketTooLongError`,
+  `TestEncodeServerPacketKeepsLargeRepliesWhole` and
   `TestUDPReplyLoopDropsRepliesTheSocketRefusesAsTooLong`
   (`proxy/shadowsocks_2022`),
   `TestUDPWriterDropsDatagramsTheSocketRefusesAsTooLong` (`proxy/shadowsocks`),
@@ -500,8 +507,9 @@ guard it.
   and MASQUE outbounds read a reply without those flags, from a socket or the
   userspace stack, so a read takes one byte more than a buffer holds
   (`buf.DatagramReader`, and `wireguard.UDPConnClient`'s own) and a reply that
-  does not fit is dropped, where upstream's readers pass its start on and the
-  Shadowsocks reader fails the cut packet's authentication and ends the
+  does not fit or that the socket fails with `EMSGSIZE`/`WSAEMSGSIZE` is
+  dropped, where upstream's readers pass its start on or end the session, and
+  the Shadowsocks reader fails the cut packet's authentication and ends the
   session.
   A UDP mask (`finalmask.udp`) hides the socket from the hub and from these
   readers, on every system, and what it takes off a packet hides the cut from
@@ -551,7 +559,8 @@ guard it.
   `TestDatagramConnectionWritesEachPacketAsOneBuffer` and
   `TestDatagramConnectionReadDropsDatagramsLongerThanTheBuffer`
   (`common/net/cnc`),
-  `TestDatagramReaderDropsDatagramsLongerThanABuffer` (`common/buf`),
+  `TestDatagramReaderDropsDatagramsLongerThanABuffer` and
+  `TestDatagramReaderSkipsSocketTooLongError` (`common/buf`),
   `TestRawListenerPreservesXDNSServerPacketReads`,
   `TestRawHeaderMaskAbovePreservingMaskDropsOversizedDatagram` and
   `TestWholeDatagramConnDropsMessageTooLong` (`transport/internet/finalmask`),
@@ -568,7 +577,8 @@ guard it.
   `TestUDPReaderDropsPacketsLongerThanARead` (`proxy/socks`),
   `TestUDPReaderDropsPacketsLongerThanARead` (`proxy/shadowsocks`),
   `TestDNSOutboundDropsRepliesLongerThanARead` (`proxy/dns`),
-  `TestUDPConnClientDropsRepliesLongerThanARead` (`proxy/wireguard`),
+  `TestUDPConnClientDropsRepliesLongerThanARead` and
+  `TestUDPConnClientSkipsSocketTooLongReadError` (`proxy/wireguard`),
   `TestPacketReaderDropsDatagramsLongerThanItsBuffer`,
   `TestPacketReaderDropsRepliesCutBelowAMask`,
   `TestDialerProxyLinkKeepsDatagramsWhole`,
